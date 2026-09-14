@@ -57,7 +57,6 @@
 #include "./hdr_compat.hpp"
 #include "./ngx_hook.hpp"
 #include "./pacing_policy.hpp"
-#include "./quality_guard.hpp"
 #include "./runtime_version.hpp"
 
 namespace mfgunlock::framecount {
@@ -89,46 +88,6 @@ inline std::atomic<unsigned int> g_max_actual_frames_presented{0};
 inline std::atomic<unsigned long long> g_state_samples{0};
 inline std::atomic<unsigned int> g_seen_present_counts{0};
 inline std::atomic_bool g_addon_enabled{true};
-
-// Some games submit HUD-less/UI resources in a color space which does not
-// match their final HDR color buffer. The resulting invalid separation mask
-// can create halos, ghosting and edge artifacts in every generated frame.
-// The optional automatic compatibility mode requests Streamline's UI-capable
-// path in SDR, but Quality Guard remains authoritative over the optional tags.
-// In HDR it uses final color rather than an untrusted optional HUD split.
-// Native remains the least-invasive default for fresh configurations. Required
-// color, depth and motion-vector inputs and frame pacing are never rewritten.
-enum class HdrCompatibilityMode : unsigned int {
-  kNative = 0,
-  kUiRecomposition = 1,
-  // Keep the serialized values stable so existing ReShade.ini selections
-  // continue to load unchanged even though fresh configurations default to 0.
-  kAutomaticHybrid = 2,
-  kFinalColorFallback = 3,
-};
-inline std::atomic<unsigned int> g_hdr_compatibility_mode{
-    static_cast<unsigned int>(HdrCompatibilityMode::kNative)};
-inline std::atomic_bool g_hdr_active{false};
-inline std::atomic_bool g_ui_recomposition_applied{false};
-inline std::atomic_bool g_ui_recomposition_fell_back{false};
-inline std::atomic<unsigned int> g_ui_recomposition_source_version{0};
-inline std::atomic<unsigned int> g_ui_recomposition_result{0};
-inline std::atomic_bool g_quality_mode_change_pending{false};
-inline std::atomic_bool g_hud_inputs_suppressed{false};
-inline std::atomic<uint32_t> g_quality_issue_mask{0};
-inline std::atomic<unsigned long long> g_quality_resets_requested{0};
-inline std::atomic<unsigned long long> g_quality_resets_injected{0};
-inline std::atomic_bool g_hdr_state_seen{false};
-inline std::atomic_bool g_quality_reset_logged{false};
-// Optional DLSS-G depth-discontinuity tuning. NVIDIA's documented default is
-// 40.0; smaller values can help when the game's linear depth is compressed.
-// It is disabled by default because the best value is integration-specific.
-inline std::atomic<unsigned int> g_depth_edge_guard_level{0};
-inline std::atomic_bool g_depth_edge_override_applied{false};
-inline std::atomic_bool g_depth_edge_override_logged{false};
-inline std::atomic<float> g_last_native_depth_separation{0.0f};
-inline std::atomic_bool g_quality_tag_batch_too_large{false};
-inline std::atomic_bool g_quality_viewport_capacity_exhausted{false};
 
 // DLSS-G 4.5/Streamline v5 can select the generated-frame count itself. The
 // provider owns its pacing, refresh-rate detection and multiplier hysteresis;
@@ -282,19 +241,12 @@ using GetStateFn =
     sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&, const sl::DLSSGOptions*);
 using GetFeatureFunctionFn = sl::Result (*)(sl::Feature, const char*, void*&);
 using InitFn = sl::Result (*)(const sl::Preferences&, uint64_t);
-using SetTagFn = sl::Result (*)(const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t,
-                               sl::CommandBuffer*);
-using SetTagForFrameFn = PFun_slSetTagForFrame*;
-using SetConstantsFn = PFun_slSetConstants*;
 using ReflexSetOptionsFn = PFun_slReflexSetOptions*;
 
 inline std::atomic<SetOptionsFn> g_real_set_options{nullptr};
 inline std::atomic<GetStateFn> g_real_get_state{nullptr};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
-inline SetTagFn g_real_set_tag = nullptr;
-inline SetTagForFrameFn g_real_set_tag_for_frame = nullptr;
-inline SetConstantsFn g_real_set_constants = nullptr;
 inline std::atomic<ReflexSetOptionsFn> g_real_reflex_set_options{nullptr};
 inline std::atomic_bool g_set_options_wrapped_logged{false};
 inline std::atomic_bool g_get_state_wrapped_logged{false};
@@ -424,154 +376,6 @@ inline sl::Result HookedReflexSetOptions(const sl::ReflexOptions& options) {
   return SubmitReflexOptions(options);
 }
 
-constexpr uint32_t kUnusedViewport = (std::numeric_limits<uint32_t>::max)();
-struct QualityViewportState {
-  SRWLOCK lock = SRWLOCK_INIT;
-  std::atomic<uint32_t> key{kUnusedViewport};
-  std::atomic_bool options_seen{false};
-  std::atomic<uint32_t> mode{0};
-  std::atomic<uint32_t> generated_frames{0};
-  std::atomic<uint32_t> flags{0};
-  std::atomic<uint32_t> color_width{0};
-  std::atomic<uint32_t> color_height{0};
-  std::atomic<uint32_t> color_format{0};
-  std::atomic<uint32_t> mvec_width{0};
-  std::atomic<uint32_t> mvec_height{0};
-  std::atomic<uint32_t> backbuffer_width{0};
-  std::atomic<uint32_t> backbuffer_height{0};
-  std::atomic<uint32_t> backbuffer_format{0};
-  std::atomic_bool hud_separation_seen{false};
-  std::atomic_bool hud_separation_suppressed{false};
-  std::atomic_bool hudless_color_seen{false};
-  std::atomic_bool ui_color_or_alpha_seen{false};
-  std::atomic_bool ui_recomposition_invalid{false};
-  std::atomic_bool ui_recomposition_eligible{false};
-  std::atomic<uint64_t> reset_requested{0};
-  std::atomic<uint64_t> reset_applied{0};
-};
-inline std::array<QualityViewportState, 8> g_quality_viewports{};
-
-inline QualityViewportState* GetQualityState(const sl::ViewportHandle& viewport) {
-  const uint32_t key = static_cast<uint32_t>(viewport);
-  for (auto& state : g_quality_viewports) {
-    if (state.key.load(std::memory_order_acquire) == key) return &state;
-  }
-  for (auto& state : g_quality_viewports) {
-    uint32_t unused = kUnusedViewport;
-    if (state.key.compare_exchange_strong(unused, key, std::memory_order_acq_rel))
-      return &state;
-    if (unused == key) return &state;
-  }
-  if (!g_quality_viewport_capacity_exhausted.exchange(
-          true, std::memory_order_relaxed)) {
-    reshade::log::message(
-        reshade::log::level::warning,
-        "mfgunlock: more than eight Streamline viewports were observed; additional viewports keep the conservative final-color path and are not state-tracked.");
-  }
-  return nullptr;
-}
-
-inline void RequestReset(QualityViewportState* state) {
-  if (state == nullptr) return;
-  state->reset_requested.fetch_add(1, std::memory_order_release);
-  g_quality_resets_requested.fetch_add(1, std::memory_order_relaxed);
-}
-
-inline void RequestAllResets() {
-  for (auto& state : g_quality_viewports) {
-    if (state.key.load(std::memory_order_acquire) != kUnusedViewport)
-      RequestReset(&state);
-  }
-}
-
-inline void ForgetOutputDescriptions() {
-  for (auto& state : g_quality_viewports) {
-    AcquireSRWLockExclusive(&state.lock);
-    state.backbuffer_width.store(0, std::memory_order_relaxed);
-    state.backbuffer_height.store(0, std::memory_order_relaxed);
-    state.backbuffer_format.store(0, std::memory_order_relaxed);
-    state.hud_separation_seen.store(false, std::memory_order_relaxed);
-    state.hud_separation_suppressed.store(false, std::memory_order_relaxed);
-    state.hudless_color_seen.store(false, std::memory_order_relaxed);
-    state.ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
-    state.ui_recomposition_invalid.store(false, std::memory_order_relaxed);
-    state.ui_recomposition_eligible.store(false, std::memory_order_relaxed);
-    ReleaseSRWLockExclusive(&state.lock);
-  }
-}
-
-inline bool UsesQualityGuard() {
-  const auto mode = static_cast<HdrCompatibilityMode>(
-      g_hdr_compatibility_mode.load(std::memory_order_relaxed));
-  return mode == HdrCompatibilityMode::kFinalColorFallback ||
-         mode == HdrCompatibilityMode::kAutomaticHybrid;
-}
-
-inline void ObserveOptionsTransition(const sl::ViewportHandle& viewport,
-                                     const sl::DLSSGOptions& options,
-                                     uint32_t generated_frames) {
-  QualityViewportState* state = GetQualityState(viewport);
-  if (state == nullptr) return;
-
-  AcquireSRWLockExclusive(&state->lock);
-
-  const uint32_t mode = static_cast<uint32_t>(options.mode);
-  const uint32_t flags = static_cast<uint32_t>(options.flags);
-  const bool changed = state->options_seen.load(std::memory_order_acquire) &&
-      (state->mode.load(std::memory_order_relaxed) != mode ||
-       state->generated_frames.load(std::memory_order_relaxed) != generated_frames ||
-       state->flags.load(std::memory_order_relaxed) != flags ||
-       state->color_width.load(std::memory_order_relaxed) != options.colorWidth ||
-       state->color_height.load(std::memory_order_relaxed) != options.colorHeight ||
-       state->color_format.load(std::memory_order_relaxed) != options.colorBufferFormat ||
-       state->mvec_width.load(std::memory_order_relaxed) != options.mvecDepthWidth ||
-       state->mvec_height.load(std::memory_order_relaxed) != options.mvecDepthHeight);
-
-  state->mode.store(mode, std::memory_order_relaxed);
-  state->generated_frames.store(generated_frames, std::memory_order_relaxed);
-  state->flags.store(flags, std::memory_order_relaxed);
-  state->color_width.store(options.colorWidth, std::memory_order_relaxed);
-  state->color_height.store(options.colorHeight, std::memory_order_relaxed);
-  state->color_format.store(options.colorBufferFormat, std::memory_order_relaxed);
-  state->mvec_width.store(options.mvecDepthWidth, std::memory_order_relaxed);
-  state->mvec_height.store(options.mvecDepthHeight, std::memory_order_relaxed);
-  state->options_seen.store(true, std::memory_order_release);
-  ReleaseSRWLockExclusive(&state->lock);
-  if (changed && UsesQualityGuard()) {
-    RequestReset(state);
-  }
-}
-
-inline qualityguard::OutputDescription ExpectedOutput(const QualityViewportState* state) {
-  if (state == nullptr) return {};
-  qualityguard::OutputDescription result{
-      state->backbuffer_width.load(std::memory_order_relaxed),
-      state->backbuffer_height.load(std::memory_order_relaxed),
-      state->backbuffer_format.load(std::memory_order_relaxed)};
-  if (!result.HasDimensions()) {
-    result.width = state->color_width.load(std::memory_order_relaxed);
-    result.height = state->color_height.load(std::memory_order_relaxed);
-  }
-  if (!result.HasFormat())
-    result.format = state->color_format.load(std::memory_order_relaxed);
-  return result;
-}
-
-inline float DepthSeparationForLevel(unsigned int level) {
-  switch (level) {
-    case 1:
-      return 20.0f;
-    case 2:
-      return 10.0f;
-    case 3:
-      return 4.0f;
-    case 4:
-      return 1.0f;
-    default:
-      return 0.0f;
-  }
-}
-
 inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
                                  const sl::DLSSGOptions& options,
                                  uint32_t generated_frames = 0,
@@ -581,26 +385,7 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
   if (!g_addon_enabled.load(std::memory_order_relaxed))
     return real(viewport, options);
 
-  const uint32_t effective_generated =
-      override_generated_frames ? generated_frames : options.numFramesToGenerate;
-  const auto quality_mode = static_cast<HdrCompatibilityMode>(
-      g_hdr_compatibility_mode.load(std::memory_order_relaxed));
   const bool game_enabled = options.mode != sl::DLSSGMode::eOff;
-  const bool explicit_recomposition =
-      quality_mode == HdrCompatibilityMode::kUiRecomposition;
-  // Enabling this option allocates Streamline's UI-capable code path. The tag
-  // guard below remains the authority for whether optional HUD-less/UI inputs
-  // are actually allowed through. Do not wait for tags before requesting the
-  // option: many games call SetOptions only once, before their first tag batch,
-  // which otherwise leaves the automatic path permanently inactive in SDR.
-  // Unknown/HDR output stays conservative until the primary swapchain has
-  // positively established SDR.
-  const bool guarded_recomposition =
-      quality_mode == HdrCompatibilityMode::kAutomaticHybrid &&
-      qualityguard::ShouldRequestAutomaticUiPath(
-          g_hdr_state_seen.load(std::memory_order_acquire),
-          g_hdr_active.load(std::memory_order_relaxed));
-  const bool recompose = game_enabled && (explicit_recomposition || guarded_recomposition);
   const bool dynamic =
       game_enabled && g_dynamic_mfg_enabled.load(std::memory_order_relaxed) &&
       g_dynamic_d3d12.load(std::memory_order_relaxed) &&
@@ -609,19 +394,11 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
       g_dynamic_supported.load(std::memory_order_relaxed) &&
       !g_dynamic_runtime_declined.load(std::memory_order_relaxed);
 
-  const auto call_original = [&](bool preserve_ui_rejection = false) {
-    ObserveOptionsTransition(viewport, options, effective_generated);
+  const auto call_original = [&]() {
     const sl::Result result = real(viewport, options);
     if (result == sl::Result::eOk && game_enabled) {
-      if (!preserve_ui_rejection) {
-        g_quality_mode_change_pending.store(false, std::memory_order_release);
-      }
       if (!g_dynamic_mfg_enabled.load(std::memory_order_relaxed)) {
         g_dynamic_change_pending.store(false, std::memory_order_release);
-      }
-      g_ui_recomposition_applied.store(false, std::memory_order_relaxed);
-      if (!preserve_ui_rejection) {
-        g_ui_recomposition_fell_back.store(false, std::memory_order_relaxed);
       }
       // Configuration changes originate on the overlay thread, but
       // Streamline/Reflex calls belong on the game's own submission thread.
@@ -634,14 +411,14 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
     return result;
   };
 
-  if (!recompose && !dynamic && !override_generated_frames)
-    return call_original(recompose);
+  if (!dynamic && !override_generated_frames)
+    return call_original();
 
   sl::DLSSGOptions forwarded{};
   const float target = static_cast<float>(
       g_dynamic_target_fps.load(std::memory_order_relaxed));
   if (!hdrcompat::BuildAdvancedOptions(options, forwarded, generated_frames,
-                                       override_generated_frames, recompose,
+                                       override_generated_frames,
                                        dynamic, target)) {
     if (override_generated_frames) {
       static std::atomic_bool warned{false};
@@ -649,19 +426,6 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
         reshade::log::message(
             reshade::log::level::warning,
             "mfgunlock: refusing to modify an unknown DLSSGOptions ABI; forwarding the game's request unchanged.");
-      }
-    }
-    if (recompose) {
-      g_ui_recomposition_applied.store(false, std::memory_order_relaxed);
-      g_quality_mode_change_pending.store(false, std::memory_order_release);
-      g_ui_recomposition_result.store(
-          static_cast<unsigned int>(sl::Result::eErrorUnsupportedInterface),
-          std::memory_order_relaxed);
-      if (!g_ui_recomposition_fell_back.exchange(true,
-                                                  std::memory_order_relaxed)) {
-        reshade::log::message(
-            reshade::log::level::warning,
-            "mfgunlock: UI Composition was not submitted because the game supplied an unknown DLSSGOptions ABI; native options were preserved.");
       }
     }
     if (dynamic) {
@@ -677,50 +441,21 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
             "mfgunlock: Dynamic MFG was not submitted because the game supplied an unknown DLSSGOptions ABI; fixed mode remains active.");
       }
     }
-    return call_original(recompose);
+    return call_original();
   }
 
-  g_ui_recomposition_source_version.store(
-      static_cast<unsigned int>(options.structVersion), std::memory_order_relaxed);
   sl::Result result = real(viewport, forwarded);
   if (result == sl::Result::eOk) {
-    g_quality_mode_change_pending.store(false, std::memory_order_release);
-    ObserveOptionsTransition(viewport, forwarded, forwarded.numFramesToGenerate);
-    if (recompose)
-      g_ui_recomposition_result.store(static_cast<unsigned int>(result),
-                                      std::memory_order_relaxed);
-    if (dynamic)
+    if (dynamic) {
       g_dynamic_result.store(static_cast<unsigned int>(result),
                              std::memory_order_relaxed);
-    if (dynamic)
       g_dynamic_set_failures.store(0, std::memory_order_relaxed);
-    if (dynamic)
       g_dynamic_fell_back.store(false, std::memory_order_relaxed);
-    if (dynamic)
       g_dynamic_change_pending.store(false, std::memory_order_release);
-    if (!g_dynamic_mfg_enabled.load(std::memory_order_relaxed))
-      g_dynamic_change_pending.store(false, std::memory_order_release);
+    }
     if (!g_dynamic_mfg_enabled.load(std::memory_order_relaxed) &&
         g_reflex_limit_applied.load(std::memory_order_acquire)) {
       RefreshReflexTarget();
-    }
-    if (recompose &&
-        !g_ui_recomposition_applied.exchange(true, std::memory_order_relaxed)) {
-      std::stringstream s;
-      s << (quality_mode == HdrCompatibilityMode::kAutomaticHybrid
-                ? "mfgunlock: Streamline's UI-capable path is enabled for SDR; "
-                  "optional HUD-less/UI inputs remain gated by Quality Guard. "
-                  "Promoted DLSSGOptions v"
-                : "mfgunlock: explicit UI recomposition enabled; promoted "
-                  "DLSSGOptions v")
-        << options.structVersion << " to v" << forwarded.structVersion << ".";
-      reshade::log::message(reshade::log::level::info, s.str().c_str());
-    }
-    if (recompose) {
-      g_ui_recomposition_fell_back.store(false, std::memory_order_relaxed);
-    } else {
-      g_ui_recomposition_applied.store(false, std::memory_order_relaxed);
-      g_ui_recomposition_fell_back.store(false, std::memory_order_relaxed);
     }
     const bool first_dynamic_apply =
         dynamic && !g_dynamic_applied.exchange(true, std::memory_order_acq_rel);
@@ -735,79 +470,35 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
     return result;
   }
 
-  // When a combined request fails, retry eDynamic once without UI
-  // recomposition only after the exact same combined request also fails. This
-  // prevents a transient feature-manager state from being misdiagnosed as an
-  // incompatible UI path. With no UI request, the dynamic-only call below is
-  // itself the one bounded same-options retry.
+  // A rejected call is retried once with the same options below: transient
+  // feature-manager state is the usual cause, and giving up on the first
+  // failure would silently lose a working configuration.
   if (dynamic) {
-    if (recompose) {
-      const sl::Result same_options_retry = real(viewport, forwarded);
-      if (same_options_retry == sl::Result::eOk) {
-        ObserveOptionsTransition(viewport, forwarded,
-                                 forwarded.numFramesToGenerate);
-        g_dynamic_result.store(static_cast<unsigned int>(same_options_retry),
-                               std::memory_order_relaxed);
-        g_dynamic_set_failures.store(0, std::memory_order_relaxed);
-        g_dynamic_fell_back.store(false, std::memory_order_relaxed);
-        g_dynamic_change_pending.store(false, std::memory_order_release);
-        g_quality_mode_change_pending.store(false, std::memory_order_release);
-        g_ui_recomposition_result.store(
-            static_cast<unsigned int>(same_options_retry),
-            std::memory_order_relaxed);
-        g_ui_recomposition_applied.store(true, std::memory_order_relaxed);
-        g_ui_recomposition_fell_back.store(false, std::memory_order_relaxed);
-        const bool first_dynamic_apply =
-            !g_dynamic_applied.exchange(true, std::memory_order_acq_rel);
-        if (first_dynamic_apply) {
-          reshade::log::message(
-              reshade::log::level::info,
-              "mfgunlock: Dynamic MFG with UI Composition was accepted on the bounded same-options retry after transient runtime state.");
-        }
-        if (first_dynamic_apply) RefreshReflexTarget();
-        return same_options_retry;
+    const sl::Result retry = real(viewport, forwarded);
+    if (retry == sl::Result::eOk) {
+      g_dynamic_result.store(static_cast<unsigned int>(retry),
+                             std::memory_order_relaxed);
+      g_dynamic_set_failures.store(0, std::memory_order_relaxed);
+      g_dynamic_fell_back.store(false, std::memory_order_relaxed);
+      g_dynamic_change_pending.store(false, std::memory_order_release);
+      const bool first_dynamic_apply =
+          !g_dynamic_applied.exchange(true, std::memory_order_acq_rel);
+      if (first_dynamic_apply) {
+        reshade::log::message(
+            reshade::log::level::info,
+            "mfgunlock: Dynamic MFG was accepted on the bounded retry after transient runtime state.");
+        RefreshReflexTarget();
       }
-      result = same_options_retry;
+      return retry;
     }
-
-    sl::DLSSGOptions dynamic_only{};
-    if (hdrcompat::BuildAdvancedOptions(options, dynamic_only, generated_frames,
-                                        override_generated_frames, false, true, target)) {
-      const sl::Result retry = real(viewport, dynamic_only);
-      if (retry == sl::Result::eOk) {
-        ObserveOptionsTransition(viewport, dynamic_only,
-                                 dynamic_only.numFramesToGenerate);
-        g_dynamic_result.store(static_cast<unsigned int>(retry),
-                               std::memory_order_relaxed);
-        g_dynamic_set_failures.store(0, std::memory_order_relaxed);
-        g_dynamic_fell_back.store(false, std::memory_order_relaxed);
-        g_dynamic_change_pending.store(false, std::memory_order_release);
-        const bool first_dynamic_apply =
-            !g_dynamic_applied.exchange(true, std::memory_order_acq_rel);
-        bool first_ui_fallback = false;
-        if (recompose) {
-          g_quality_mode_change_pending.store(false,
-                                              std::memory_order_release);
-          g_ui_recomposition_applied.store(false, std::memory_order_relaxed);
-          g_ui_recomposition_result.store(static_cast<unsigned int>(result),
-                                          std::memory_order_relaxed);
-          first_ui_fallback = !g_ui_recomposition_fell_back.exchange(
-              true, std::memory_order_relaxed);
-        }
-        if (first_dynamic_apply || first_ui_fallback) {
-          reshade::log::message(
-              reshade::log::level::info,
-              recompose
-                  ? (quality_mode == HdrCompatibilityMode::kAutomaticHybrid
-                         ? "mfgunlock: Dynamic MFG accepted after UI recomposition was removed; Quality Guard fallback remains active."
-                         : "mfgunlock: Dynamic MFG accepted after UI recomposition was removed; native UI handling remains active.")
-                  : "mfgunlock: Dynamic MFG accepted on the bounded retry after transient runtime state.");
-        }
-        if (first_dynamic_apply) RefreshReflexTarget();
-        return retry;
-      }
-      result = retry;
-    }
+    result = retry;
+  }
+  // Dynamic accounting only. A failed fixed-multiplier override must not touch
+  // Dynamic state: doing so would record a Dynamic rejection that never
+  // happened and could park g_dynamic_runtime_declined, blocking Dynamic MFG
+  // from being attempted again until the next FG off/on cycle. The fixed
+  // override's own callers report that failure.
+  if (dynamic) {
     g_dynamic_result.store(static_cast<unsigned int>(result),
                            std::memory_order_relaxed);
     constexpr unsigned int kMaxTransientDynamicFailures = 4;
@@ -830,259 +521,7 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
       reshade::log::message(reshade::log::level::warning, s.str().c_str());
     }
   }
-
-  if (recompose) {
-    g_quality_mode_change_pending.store(false, std::memory_order_release);
-    g_ui_recomposition_result.store(static_cast<unsigned int>(result),
-                                    std::memory_order_relaxed);
-    if (!g_ui_recomposition_fell_back.exchange(true, std::memory_order_relaxed)) {
-      std::stringstream s;
-      s << "mfgunlock: UI recomposition was rejected with sl::Result "
-        << static_cast<unsigned int>(result)
-        << (quality_mode == HdrCompatibilityMode::kAutomaticHybrid
-                ? "; the Quality Guard/final-color path remains active."
-                : "; the game's native UI path remains active.");
-      reshade::log::message(reshade::log::level::warning, s.str().c_str());
-    }
-  }
-  return call_original(recompose);
-}
-
-template <typename Forward>
-inline sl::Result FilterHudSeparationTags(const sl::ViewportHandle& viewport,
-                                          const sl::ResourceTag* tags, uint32_t count,
-                                          Forward&& forward) {
-  const bool filter = g_addon_enabled.load(std::memory_order_relaxed) &&
-                      UsesQualityGuard();
-  if (!filter || tags == nullptr || count == 0)
-    return forward(tags);
-  if (count > 64) {
-    if (!g_quality_tag_batch_too_large.exchange(true, std::memory_order_relaxed)) {
-      reshade::log::message(
-          reshade::log::level::warning,
-          "mfgunlock: Quality Guard received more than 64 tags in one call; that oversized batch is forwarded unchanged instead of being partially filtered.");
-    }
-    return forward(tags);
-  }
-
-  QualityViewportState* state = GetQualityState(viewport);
-  const bool hdr_active = g_hdr_active.load(std::memory_order_relaxed);
-  qualityguard::OutputDescription expected{};
-  if (state != nullptr) {
-    AcquireSRWLockShared(&state->lock);
-    expected = ExpectedOutput(state);
-    ReleaseSRWLockShared(&state->lock);
-  }
-  const qualityguard::Assessment assessment = qualityguard::AssessTags(
-      tags, count, hdr_active, expected);
-  const bool hybrid =
-      g_hdr_compatibility_mode.load(std::memory_order_relaxed) ==
-      static_cast<unsigned int>(HdrCompatibilityMode::kAutomaticHybrid);
-  bool recomposition_eligible = false;
-  bool suppress_hud_separation = assessment.suppress_hud_separation;
-  if (state != nullptr) {
-    AcquireSRWLockExclusive(&state->lock);
-    bool output_changed = false;
-    if (assessment.observed_backbuffer.HasDimensions()) {
-      const uint32_t previous_width =
-          state->backbuffer_width.load(std::memory_order_relaxed);
-      const uint32_t previous_height =
-          state->backbuffer_height.load(std::memory_order_relaxed);
-      output_changed = (previous_width != 0 && previous_height != 0) &&
-                       (previous_width != assessment.observed_backbuffer.width ||
-                        previous_height != assessment.observed_backbuffer.height);
-      state->backbuffer_width.store(assessment.observed_backbuffer.width,
-                                    std::memory_order_relaxed);
-      state->backbuffer_height.store(assessment.observed_backbuffer.height,
-                                     std::memory_order_relaxed);
-    }
-    if (assessment.observed_backbuffer.HasFormat()) {
-      const uint32_t previous_format =
-          state->backbuffer_format.load(std::memory_order_relaxed);
-      output_changed = output_changed ||
-                       (previous_format != 0 &&
-                        previous_format != assessment.observed_backbuffer.format);
-      state->backbuffer_format.store(assessment.observed_backbuffer.format,
-                                     std::memory_order_relaxed);
-    }
-    if (output_changed) {
-      state->hudless_color_seen.store(false, std::memory_order_relaxed);
-      state->ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
-      state->ui_recomposition_invalid.store(false, std::memory_order_relaxed);
-      state->ui_recomposition_eligible.store(false, std::memory_order_relaxed);
-      RequestReset(state);
-    }
-
-    // Changing between an optional HUD split and final-color input invalidates
-    // the temporal history just as a resolution change does. Only observe tag
-    // calls that actually contain HUD/UI resources because games may submit
-    // required resources in separate batches.
-    if (assessment.has_hud_separation) {
-      if (hybrid) {
-        const bool was_recomposition_eligible =
-            state->ui_recomposition_eligible.load(std::memory_order_relaxed);
-        if (assessment.clears_hudless_color)
-          state->hudless_color_seen.store(false, std::memory_order_release);
-        if (assessment.clears_ui_color_or_alpha)
-          state->ui_color_or_alpha_seen.store(false, std::memory_order_release);
-        if (assessment.clears_hudless_color ||
-            assessment.clears_ui_color_or_alpha) {
-          state->ui_recomposition_invalid.store(false,
-                                                 std::memory_order_release);
-        }
-        if (assessment.has_hudless_color)
-          state->hudless_color_seen.store(true, std::memory_order_release);
-        if (assessment.has_ui_color_or_alpha)
-          state->ui_color_or_alpha_seen.store(true, std::memory_order_release);
-        const bool complete_current_pair =
-            assessment.has_hudless_color && assessment.has_ui_color_or_alpha;
-        if (complete_current_pair &&
-            !qualityguard::HasStructuralIssues(assessment)) {
-          state->ui_recomposition_invalid.store(false,
-                                                 std::memory_order_release);
-        } else if (qualityguard::HasStructuralIssues(assessment)) {
-          state->ui_recomposition_invalid.store(true, std::memory_order_release);
-        }
-        qualityguard::Assessment accumulated = assessment;
-        accumulated.has_hudless_color =
-            state->hudless_color_seen.load(std::memory_order_acquire);
-        accumulated.has_ui_color_or_alpha =
-            state->ui_color_or_alpha_seen.load(std::memory_order_acquire);
-        if (state->ui_recomposition_invalid.load(std::memory_order_acquire)) {
-          accumulated.issues |= qualityguard::kInvalidOptionalResource;
-        }
-        recomposition_eligible =
-            qualityguard::CanAutomaticallyUseUiRecomposition(accumulated,
-                                                               hdr_active);
-        // Streamline tags expose resource formats but no color-space metadata.
-        // Hybrid mode keeps only a structurally valid split; any concrete
-        // mismatch remains fail-closed to final color.
-        // Some games submit HUD-less and UI tags in separate calls. When the
-        // second half first makes the pair eligible, suppress that transition
-        // batch too; otherwise Streamline would receive UI without the HUD-less
-        // partner that was filtered moments earlier. The complete pair is used
-        // from the next tag submission onward. A batch containing both halves
-        // can be forwarded immediately.
-        suppress_hud_separation = !recomposition_eligible ||
-            (!was_recomposition_eligible && !complete_current_pair);
-      }
-      const bool was_seen =
-          state->hud_separation_seen.exchange(true, std::memory_order_acq_rel);
-      const bool was_suppressed = state->hud_separation_suppressed.exchange(
-          suppress_hud_separation, std::memory_order_acq_rel);
-      const bool was_eligible = state->ui_recomposition_eligible.exchange(
-          recomposition_eligible, std::memory_order_acq_rel);
-      if ((!was_seen && suppress_hud_separation) ||
-          (was_seen && (was_suppressed != suppress_hud_separation ||
-                        was_eligible != recomposition_eligible))) {
-        RequestReset(state);
-      }
-    }
-    ReleaseSRWLockExclusive(&state->lock);
-  } else if (hybrid && assessment.has_hud_separation) {
-    // No viewport state means validation cannot be carried across split tag
-    // submissions, so keep the conservative final-color behavior.
-    suppress_hud_separation = true;
-  }
-  if (!suppress_hud_separation) return forward(tags);
-
-  static_assert(std::is_trivially_copyable_v<sl::ResourceTag>);
-  alignas(sl::ResourceTag)
-      std::array<std::byte, sizeof(sl::ResourceTag) * 64> storage;
-  std::memcpy(storage.data(), tags, sizeof(sl::ResourceTag) * count);
-  auto* forwarded = reinterpret_cast<sl::ResourceTag*>(storage.data());
-  const uint32_t suppressed = hdrcompat::SuppressHudSeparationResources(forwarded, count);
-  if (suppressed == 0) return forward(tags);
-
-  const uint32_t previous_issues =
-      g_quality_issue_mask.fetch_or(assessment.issues, std::memory_order_relaxed);
-  if (!g_hud_inputs_suppressed.exchange(true, std::memory_order_relaxed)) {
-    reshade::log::message(
-        reshade::log::level::info,
-        "mfgunlock: Quality Guard is active; incompatible optional HUD-less/UI tags are cleared before Streamline while color, depth, motion vectors, multiplier and pacing are preserved.");
-  }
-  if ((assessment.issues & ~previous_issues) != 0) {
-    std::stringstream s;
-    s << "mfgunlock: Quality Guard observed new optional-input issue mask 0x"
-      << std::hex << assessment.issues << std::dec
-      << "; using final color for this tag submission.";
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
-  }
-  return forward(forwarded);
-}
-
-inline sl::Result HookedSetTag(const sl::ViewportHandle& viewport,
-                               const sl::ResourceTag* tags, uint32_t count,
-                               sl::CommandBuffer* command_buffer) {
-  if (g_real_set_tag == nullptr) return sl::Result::eErrorNotInitialized;
-  return FilterHudSeparationTags(viewport, tags, count, [&](const sl::ResourceTag* forwarded) {
-    return g_real_set_tag(viewport, forwarded, count, command_buffer);
-  });
-}
-
-inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame,
-                                       const sl::ViewportHandle& viewport,
-                                       const sl::ResourceTag* tags, uint32_t count,
-                                       sl::CommandBuffer* command_buffer) {
-  if (g_real_set_tag_for_frame == nullptr) return sl::Result::eErrorNotInitialized;
-  return FilterHudSeparationTags(viewport, tags, count, [&](const sl::ResourceTag* forwarded) {
-    return g_real_set_tag_for_frame(frame, viewport, forwarded, count, command_buffer);
-  });
-}
-
-inline sl::Result HookedSetConstants(const sl::Constants& values,
-                                     const sl::FrameToken& frame,
-                                     const sl::ViewportHandle& viewport) {
-  if (g_real_set_constants == nullptr) return sl::Result::eErrorNotInitialized;
-  if (!g_addon_enabled.load(std::memory_order_relaxed))
-    return g_real_set_constants(values, frame, viewport);
-
-  QualityViewportState* state = GetQualityState(viewport);
-  if (state == nullptr || !state->options_seen.load(std::memory_order_acquire) ||
-      state->mode.load(std::memory_order_relaxed) ==
-          static_cast<uint32_t>(sl::DLSSGMode::eOff)) {
-    return g_real_set_constants(values, frame, viewport);
-  }
-  const uint64_t requested = state->reset_requested.load(std::memory_order_acquire);
-  const bool reset_pending =
-      requested != state->reset_applied.load(std::memory_order_relaxed);
-  const float depth_override = DepthSeparationForLevel(
-      g_depth_edge_guard_level.load(std::memory_order_relaxed));
-  const bool override_depth = values.structVersion >= sl::kStructVersion2 &&
-                              depth_override > 0.0f;
-  if (!reset_pending && !override_depth)
-    return g_real_set_constants(values, frame, viewport);
-
-  alignas(sl::Constants) std::array<std::byte, sizeof(sl::Constants)> storage{};
-  if (!qualityguard::CopyConstantsWithQualityOverrides(
-          values, storage.data(), storage.size(),
-          reset_pending && values.reset != sl::Boolean::eTrue, depth_override)) {
-    return g_real_set_constants(values, frame, viewport);
-  }
-  const sl::Result result = g_real_set_constants(
-      *reinterpret_cast<const sl::Constants*>(storage.data()), frame, viewport);
-  if (result == sl::Result::eOk && override_depth) {
-    g_last_native_depth_separation.store(
-        values.minRelativeLinearDepthObjectSeparation, std::memory_order_relaxed);
-    g_depth_edge_override_applied.store(true, std::memory_order_relaxed);
-    if (!g_depth_edge_override_logged.exchange(true, std::memory_order_relaxed)) {
-      std::stringstream s;
-      s << "mfgunlock: optional DLSS-G depth-edge guard is active (game "
-        << values.minRelativeLinearDepthObjectSeparation << ", forwarded "
-        << depth_override << ").";
-      reshade::log::message(reshade::log::level::info, s.str().c_str());
-    }
-  }
-  if (result == sl::Result::eOk && reset_pending) {
-    state->reset_applied.store(requested, std::memory_order_release);
-    g_quality_resets_injected.fetch_add(1, std::memory_order_relaxed);
-    if (!g_quality_reset_logged.exchange(true, std::memory_order_relaxed)) {
-      reshade::log::message(
-          reshade::log::level::info,
-          "mfgunlock: Quality Guard synchronized Streamline temporal history after an HDR, swapchain, resolution or multiplier transition.");
-    }
-  }
-  return result;
+  return call_original();
 }
 
 // Which sl.dlss_g the game ends up using is influenced here at slInit, not by
@@ -1333,9 +772,8 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     }
   }
 
-  // Forward through a local upgraded structure when HDR recomposition is
-  // active. The native fallback temporarily changes only the requested count
-  // and restores the game-owned structure before returning.
+  // Forward through a local copy of the options so the requested count can be
+  // overridden without modifying the game-owned structure.
   sl::Result result = CallSetOptions(viewport, options, desired, true);
 
   // A rejected call means frame generation just stays off, which looks exactly
@@ -1616,47 +1054,6 @@ inline std::atomic_bool g_installing{false};
 
 }  // namespace internal
 
-// A temporal reset is only requested after a state transition. It is consumed
-// once by HookedSetConstants and never injected continuously, so normal frame
-// pacing and the game's steady-state temporal history remain untouched.
-inline void NotifyHdrState(bool hdr) {
-  if (g_hdr_state_seen.load(std::memory_order_acquire) &&
-      g_hdr_active.load(std::memory_order_relaxed) == hdr) {
-    return;
-  }
-  const bool previous = g_hdr_active.exchange(hdr, std::memory_order_relaxed);
-  const bool seen = g_hdr_state_seen.exchange(true, std::memory_order_acq_rel);
-  if ((!seen || previous != hdr) && internal::UsesQualityGuard()) {
-    internal::ForgetOutputDescriptions();
-    internal::RequestAllResets();
-  }
-}
-
-inline void NotifySwapchainTransition() {
-  internal::ForgetOutputDescriptions();
-  if (internal::UsesQualityGuard()) {
-    internal::RequestAllResets();
-  }
-}
-
-inline void NotifyQualityModeChanged() {
-  g_ui_recomposition_applied.store(false, std::memory_order_relaxed);
-  g_ui_recomposition_fell_back.store(false, std::memory_order_relaxed);
-  g_ui_recomposition_result.store(0, std::memory_order_relaxed);
-  g_hud_inputs_suppressed.store(false, std::memory_order_relaxed);
-  g_quality_issue_mask.store(0, std::memory_order_relaxed);
-  g_quality_tag_batch_too_large.store(false, std::memory_order_relaxed);
-  g_quality_mode_change_pending.store(true, std::memory_order_release);
-  internal::ForgetOutputDescriptions();
-  internal::RequestAllResets();
-}
-
-inline void NotifyDepthEdgeTuningChanged() {
-  g_depth_edge_override_applied.store(false, std::memory_order_relaxed);
-  g_depth_edge_override_logged.store(false, std::memory_order_relaxed);
-  internal::RequestAllResets();
-}
-
 inline void NotifyDynamicD3D12(bool d3d12) {
   g_dynamic_d3d12.store(d3d12, std::memory_order_relaxed);
 }
@@ -1687,10 +1084,9 @@ inline void NotifyDynamicModeChanged() {
       static_cast<unsigned int>(
           forcepolicy::IsFixedMultiplier(
               g_force_multiplier.load(std::memory_order_relaxed))
-              ? forcepolicy::FixedOverrideStatus::kPending
-              : forcepolicy::FixedOverrideStatus::kNative),
-      std::memory_order_release);
-  internal::RequestAllResets();
+               ? forcepolicy::FixedOverrideStatus::kPending
+               : forcepolicy::FixedOverrideStatus::kNative),
+       std::memory_order_release);
 }
 
 // Must land before the game asks for the function pointer, which it does once
@@ -1710,25 +1106,10 @@ inline void TryInstall() {
     return;
   }
 
-  std::vector<hook::HookItem> hooks = {
-      {"slGetFeatureFunction", reinterpret_cast<void**>(&internal::g_real_get_feature_function),
-       reinterpret_cast<void*>(&internal::HookedGetFeatureFunction)}};
-  if (GetProcAddress(interposer, "slSetTag") != nullptr) {
-    hooks.push_back(
-        {"slSetTag", reinterpret_cast<void**>(&internal::g_real_set_tag),
-         reinterpret_cast<void*>(&internal::HookedSetTag)});
-  }
-  if (GetProcAddress(interposer, "slSetTagForFrame") != nullptr) {
-    hooks.push_back(
-        {"slSetTagForFrame", reinterpret_cast<void**>(&internal::g_real_set_tag_for_frame),
-         reinterpret_cast<void*>(&internal::HookedSetTagForFrame)});
-  }
-  if (GetProcAddress(interposer, "slSetConstants") != nullptr) {
-    hooks.push_back(
-        {"slSetConstants", reinterpret_cast<void**>(&internal::g_real_set_constants),
-         reinterpret_cast<void*>(&internal::HookedSetConstants)});
-  }
-  // slInit is only detoured for an explicit provider-selection override.
+   std::vector<hook::HookItem> hooks = {
+       {"slGetFeatureFunction", reinterpret_cast<void**>(&internal::g_real_get_feature_function),
+        reinterpret_cast<void*>(&internal::HookedGetFeatureFunction)}};
+   // slInit is only detoured for an explicit provider-selection override.
   if (g_runtime_selection_mode.load(std::memory_order_relaxed) !=
       static_cast<unsigned int>(RuntimeSelectionMode::kGameDefault)) {
     hooks.push_back(

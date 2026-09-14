@@ -5,12 +5,6 @@ A [ReShade](https://reshade.me/) addon that enables **DLSS multi-frame generatio
 RTX 50-series only — and corrects the frame interpolation so the extra frames
 carry new motion instead of repeats.
 
-The default for a new installation is **Native**, which preserves the game's
-existing HUD/UI tags and is recommended for most games. **Automatic Guard + UI
-Composition (HDR compatibility)** remains available for known HDR-related
-issues and keeps the game's required color, depth and motion-vector inputs
-intact.
-
 Nothing in the game installation is modified. Every patch is applied to the
 mapped image at runtime and reverted when the addon unloads. **No complete
 NVIDIA DLL or provider package is redistributed here.**
@@ -47,25 +41,6 @@ compatibility. The repository history and current code attribute these additions
 - Support and fixes for **S.T.A.L.K.E.R. 2: Heart of Chornobyl**, including its
   native 3x/4x selector and bundled/OTA provider handling.
 - Temporal-patch compatibility with newer 310.9 DLSS-G providers.
-- An exact-fingerprint Blackwell framework-kernel path for Ada, covering the
-  motion-vector, inpaint, and inpaint-decision stages, with the established
-  temporal correction retained as a safe fallback. This path follows the
-  Blackwell-kernel research and rebuild workflow published by Matias Lombo.
-- **Intermediate Scatter Retention**, independently investigated and implemented
-  in this fork. It conservatively relaxes one motion-consistency rejection while
-  intermediate-frame motion vectors are constructed, while retaining the
-  separate depth-mismatch test.
-- **Validated Warp Blend**, a separate conservative candidate-validation and
-  blending path informed by Tony Joaca's public `qualityValidWarp` research in
-  DLSSG-Transfusion and independently implemented for this addon.
-- The two complementary thin-geometry quality mechanisms enabled together as
-  experimental defaults while remaining independently selectable per game.
-- Exact DLSS-G 310.9.0/310.9.1 provider and payload validation for the
-  thin-geometry paths, with unknown providers failing closed instead of being
-  patched speculatively.
-- Safer reconstructed-fatbin handling that preserves kernels and metadata after
-  the modified PTX entry, plus hardened restoration that avoids leaving a live
-  provider descriptor pointing to released replacement memory.
 - Safer ReShade addon lifecycle handling across temporary device probing and
   addon reloads.
 - Bounded background provider discovery, removing continuous module enumeration
@@ -77,29 +52,13 @@ compatibility. The repository history and current code attribute these additions
 - A concise normal telemetry display that hides the cumulative sample counter
   without removing presentation counts, multiplier validation, or diagnostic
   logging.
-- A conservative Streamline input Quality Guard that avoids incompatible
-  optional HUD/UI separation resources, including the HDR mismatch confirmed
-  during Hogwarts Legacy testing.
-- **Automatic Guard + UI Composition**, including HUD-less/UI validation,
-  conservative HDR final-color fallback, transition-safe split-tag handling,
-  and one-shot temporal-history synchronization.
-- HDR + Frame Generation investigation and compatibility work based on captures
-  from Hogwarts Legacy, with related diagnostic tooling intended for comparison
-  against other integrations such as Jedi Survivor.
 - Native NVIDIA Dynamic MFG integration through `DLSSGMode::eDynamic`, including
   exact release-stack checks, proactive capability validation for older games,
   correct VSync target semantics, bounded retries, and fixed-MFG fallback.
 - Absolute fixed-multiplier control from 2x through 6x, allowing the addon to
   lower or raise the game's request while preserving Dynamic MFG priority and
   distinguishing game, addon, effective, observed, and pending states.
-- **Native** quality mode as the least-invasive default for new configurations,
-  while preserving every explicitly saved choice from existing users.
-- Optional depth-edge tuning for integrations whose native linear-depth
-  separation produces visible disocclusion artifacts. It is off by default.
 - Experimental Vulkan renderer and NGX provider discovery.
-- Reusable PresentMon/NVAPI validation tooling and controlled frame-pacing
-  evidence, including an observed 3.998x cadence in Onimusha: Way of the Sword
-  with Intermediate Scatter Retention and Validated Warp Blend active at 4x.
 - Compatibility testing and documentation across the games and runtime
   combinations listed below.
 
@@ -109,14 +68,13 @@ replace or claim authorship of either original contribution.
 ## Contents
 
 - [Tested Games](#tested-games)
+- [Known Multiplier Behavior](#known-multiplier-behavior)
 - [Requirements](#requirements)
 - [Usage](#usage)
 - [Using with RenoDX DLSS5](#using-with-renodx-dlss5)
 - [Selecting the Streamline Runtime](#selecting-the-streamline-runtime)
 - [Verifying Operation](#verifying-operation)
 - [Experimental Vulkan Support](#experimental-vulkan-support)
-- [Frame-generation Input Quality](#frame-generation-input-quality)
-- [Experimental Thin-geometry Interpolation](#experimental-thin-geometry-interpolation)
 - [Dynamic Multi Frame Generation](#dynamic-multi-frame-generation)
 - [Version Matrix and Advanced Runtime Setup](#version-matrix-and-advanced-runtime-setup)
 - [Settings](#settings)
@@ -164,19 +122,15 @@ replace or claim authorship of either original contribution.
 | Ghost of Tsushima | Working |
 | Crimson Desert | Maybe |
 | Gothic 1 Remake | Working |
-| Jusant | Working with HDR fix |
-| Hogwarts Legacy | Working with HDR fix |
-| Mafia: The Old Country | Working with HDR fix |
+| Jusant | Working |
+| Hogwarts Legacy | Working |
+| Mafia: The Old Country | Working |
 | Dying Light: The Beast | Working |
 | Onimusha: Way of the Sword | Working |
 
 These are the games personally tested with this fork; this is not a claim of
 universal compatibility. Results may vary with the game version, DLSS and
 Streamline versions, GPU, drivers, and configuration.
-
-**Working with HDR fix** means selecting **Automatic Guard + UI Composition
-(HDR compatibility)** if the HDR issue occurs. If that mode introduces an
-artifact on a HUD/UI element, switch back to **Native**.
 
 ## Known Multiplier Behavior
 
@@ -319,11 +273,11 @@ Frame Generation enabled in the game, check the following:
   `numFramesActuallyPresented` value is the count since the game's previous
   state query, not a direct multiplier readout.
 
-The presentation count comes from NVIDIA Streamline's `slDLSSGGetState`. Use the
-read-only diagnostic NVAPI snapshot or an external presentation trace to
-corroborate the active multiplier. For frame-pacing analysis, inspect actual
-display intervals; ordinary application-Present counters may not represent the
-final display timing used by DLSS-G.
+The presentation count comes from NVIDIA Streamline's `slDLSSGGetState`. An
+external presentation trace (for example Microsoft PresentMon) can corroborate
+the active multiplier. For frame-pacing analysis, inspect actual display
+intervals; ordinary application-Present counters may not represent the final
+display timing used by DLSS-G.
 
 ## Experimental Vulkan Support
 
@@ -365,99 +319,6 @@ scope of MFG Unlock and may be especially useful when ReShade cannot be installe
 
 **Credit:** Huge thanks to [u/amart565](https://www.reddit.com/user/amart565/) 
 for testing the Xbox Game Pass / UWP installation path and putting together the detailed community guide.
-
-## Frame-generation Input Quality
-
-The default for new configurations is **Native**, which passes the game's
-optional HUD-less and UI tags through unchanged. It is the least-invasive mode
-and is recommended for most games. Existing saved selections are preserved.
-
-DLSS-G can receive an optional HUD-less scene plus a UI color/alpha mask so it
-does not interpolate the interface as ordinary world geometry. This works only
-when those resources obey Streamline's contract: matching output extents,
-compatible formats, sufficient alpha precision, premultiplied UI color, and the
-same color space/post-processing as final color.
-
-**Automatic Guard + UI Composition (HDR compatibility)** is intended for
-HDR-related artifacts in known affected games such as Hogwarts Legacy, Jusant,
-and Mafia: The Old Country. If HUD/UI elements show artifacts while it is
-selected, switch back to **Native**.
-
-The compatibility mode validates the metadata the addon can observe. Once the
-primary swapchain positively reports SDR, the addon requests Streamline's
-UI-capable path early because many games call `SetOptions` before their first
-resource tags. That request only allocates the capable path: the guard still
-forwards optional HUD-less/UI inputs after it has observed a complete,
-structurally valid pair. When a pair is invalid, incomplete, or arrives in an
-unsafe split transition, the addon clears only those optional tags and lets
-DLSS-G use final color. In HDR it uses final color automatically because
-Streamline resource tags do not expose enough color-space information to prove
-that the HUD-less buffer matches a PQ/scRGB final buffer. The explicit **Force
-UI Composition (Advanced)** mode remains available for a game whose HDR
-integration has been independently verified.
-
-This can mitigate UI/HUD ghosting, flicker, bright halos, invalid masking, and
-composition mismatches in affected integrations. It does not claim that every
-artifact has that cause, and it cannot repair incorrect motion vectors, depth,
-exposure, camera matrices, distortion data, or pixels produced by the game.
-
-> **UI Composition example:** This community video shows the type of UI/HUD-related
-> Frame Generation artifact that UI Composition is intended to mitigate in
-> affected integrations: https://www.youtube.com/watch?v=xV_E-cvyu8Q
-
-The guard requests one Streamline temporal reset after an actual HDR,
-swapchain, resolution, option, multiplier, or quality-mode transition. It does
-not inject continuous resets. Required color, depth and motion-vector tags, the
-selected multiplier, the temporal kernel, and presentation pacing are not
-rewritten by the guard.
-
-The optional **depth-edge guard** changes Streamline's existing minimum relative
-linear-depth separation value. Lower values may improve disocclusion around
-nearby objects or screen edges in some games, but the best value is
-integration-specific. It is disabled by default and does not add camera-turn
-resets or a separate pacing path.
-
-## Experimental Thin-geometry Interpolation
-
-These controls modify separate stages of the DLSS-G kernel pipeline. They do
-not change the selected multiplier, presentation pacing, Reflex, Dynamic MFG,
-HUD/UI tags, or HDR color handling. They currently require an exactly validated
-DLSS-G 310.9.0 or 310.9.1 provider; unknown or changed providers fail closed and
-keep the normal kernel path. Changes take effect after restarting the game.
-
-**Intermediate scatter retention (Experimental — Recommended)** and
-**Validated warp blend (Experimental — Recommended)** are enabled together by
-default when no saved settings exist. They remain independently selectable,
-and existing explicitly saved choices are preserved.
-
-Intermediate scatter retention relaxes one motion-consistency
-rejection while DLSS-G constructs motion vectors for intermediate generated
-frames. The kernel's separate depth-mismatch test remains active. This can
-preserve more useful motion for fences, wires, foliage, small objects, character
-outlines, and weapon edges. Because retaining additional motion can also retain
-an incorrect vector, disable it if a particular game develops trails, ghosting,
-stretched pixels, or worse disocclusion artifacts.
-
-Validated warp blend is a separate later-stage experiment. It checks
-warped-coordinate bounds, invalid-vector sentinels,
-finite color values, and agreement between two candidates before gradually
-increasing how strongly accepted warped color is used. It may reduce flicker or
-the breakup of thin moving detail, but can increase temporal persistence or
-ghosting in some scenes. This implementation was informed by Tony Joaca's public
-DLSSG-Transfusion `qualityValidWarp` work, but is independently implemented and
-intentionally uses additional conservative validation rather than copying its
-complete behavior.
-
-The two options are deliberately independent: **Intermediate scatter
-retention** changes which motion information survives during intermediate-frame
-construction, while **Validated warp blend** changes how accepted candidates
-are blended later. For troubleshooting, test one option at a time and restart
-between changes.
-
-**Previous-to-current scatter retention** remains available only as an advanced
-research control. It changes a different rejection path between real frames,
-was unstable in initial game testing, and is disabled by default. It is not
-recommended for normal use.
 
 ## Dynamic Multi Frame Generation
 
@@ -513,11 +374,11 @@ The table separates general fixed-MFG compatibility from features that depend
 on the new Dynamic ABI. “Validated” means the listed path has been exercised;
 it is not a universal claim for every game or presentation setup.
 
-| DLSS-G | Streamline | General addon / fixed MFG | Automatic Guard | UI Composition | Dynamic MFG | VSync / G-SYNC notes |
-|---|---|---|---|---|---|---|
-| 310.9.0 | 2.12.x | Validated legacy/compatibility path | Validated | Not release-validated on this older wrapper | Not supported by this release | Keep the game's established sync path; do not assume the 2.14.1 Dynamic/VSync behavior |
-| 310.9.0 | 2.14.0 / internal RC builds | Fixed MFG may work, including NVIDIA App override builds | Not release-validated as a complete combination | Not release-validated | The underlying runtime may expose Dynamic without VSync when its capability bit is true, but this addon does not advertise this combination as supported | Do not assume 2.14.1 VSync/frame-limiter behavior; use the exact current stack below for release testing |
-| 310.9.1 | 2.14.1 | Validated current path | Validated | Validated where the game supplies a correct pair; slight provider cost is expected | Supported on D3D12 when the runtime capability bit is true; final in-game release retest pending | VSync optional; with VSync, target follows refresh. G-SYNC remains a driver/display choice; capability and Independent Flip still matter |
+| DLSS-G | Streamline | General addon / fixed MFG | Dynamic MFG | VSync / G-SYNC notes |
+|---|---|---|---|---|
+| 310.9.0 | 2.12.x | Validated legacy/compatibility path | Not supported by this release | Keep the game's established sync path; do not assume the 2.14.1 Dynamic/VSync behavior |
+| 310.9.0 | 2.14.0 / internal RC builds | Fixed MFG may work, including NVIDIA App override builds | The underlying runtime may expose Dynamic without VSync when its capability bit is true, but this addon does not advertise this combination as supported | Do not assume 2.14.1 VSync/frame-limiter behavior; use the exact current stack below for release testing |
+| 310.9.1 | 2.14.1 | Validated current path | Supported on D3D12 when the runtime capability bit is true; final in-game release retest pending | VSync optional; with VSync, target follows refresh. G-SYNC remains a driver/display choice; capability and Independent Flip still matter |
 
 ### Manually using the current NVIDIA runtime
 
@@ -594,13 +455,11 @@ frame-limiter behavior to Dynamic mode; it does not make a custom Dynamic target
 override the monitor-refresh target while VSync is active.
 
 The addon does not write NVIDIA driver profiles, NVPI settings, or NVIDIA App
-settings. Public
-`NvAPI_NGX_GetNGXOverrideState` is used only by the optional diagnostic tool to
-observe override feedback; there is no verified public NVAPI call here that can
-safely force this per-game policy after Streamline/NGX initialization. To stop
-Streamline itself from choosing downloaded OTA plugins during a controlled test,
-select **Prefer local runtime**, restart, and verify the loaded paths/versions in
-the log.
+settings, and there is no verified public NVAPI call that can safely force this
+per-game policy after Streamline/NGX initialization. To stop Streamline itself
+from choosing downloaded OTA plugins during a controlled test, select
+**Prefer local runtime**, restart, and verify the loaded paths/versions in the
+log.
 
 ## Settings
 
@@ -612,18 +471,12 @@ Written to your `ReShade.ini` under `[RenoDX.MFGUnlock]`:
 | `MaxCount` | `4` | The `DLSSG.MultiFrameCountMax` value reported to the runtime |
 | `ForceFlipMeteringOff` | `0` | Normally leave off. Enable only if 3x/4x freezes; this forces Streamline's legacy software pacing fallback and requires a game restart |
 | `TemporalFix` | `1` | The interpolation correction. Leave on; changing it requires a restart |
-| `BlackwellFrameworkKernels` | `1` | Uses the exact-fingerprint Blackwell motion-vector/inpaint/inpaint-decision replacements when the installed provider matches; otherwise falls back to the 0.7 temporal correction. Changing it requires a restart |
-| `ThinGeometryIntermediateScatter` | `1` | Experimental recommended default: retains more motion information while constructing intermediate generated frames; keeps the separate depth test and requires the validated full Blackwell path. Disable per game if it adds ghosting or disocclusion artifacts |
-| `ThinGeometryValidatedWarpBlend` | `1` | Experimental recommended default paired with Intermediate scatter retention: validates warped candidates before gradually increasing their blend weight; may reduce thin-detail flicker but can increase temporal persistence. Requires a restart |
-| `ThinGeometryPreviousScatter` | `0` | Unstable advanced research control for a separate previous-to-current motion-rejection path; not recommended for normal use |
 | `ForceMultiplier` | `0` | `0` respects the game's own choice; `2`–`6` requests that exact multiplier, whether it is higher or lower than the game's choice |
 | `DynamicMFG` | `0` | Requests native NVIDIA Dynamic MFG only on the validated 310.9.1 + 2.14.1 D3D12 stack after the provider reports support; takes priority over `ForceMultiplier` while active |
 | `DynamicTargetFPS` | `0` | Dynamic output target; `0` follows display refresh. With VSync active, Streamline ignores a nonzero value and follows refresh instead |
 | `DynamicReflexSourceCap` | `0` | Advanced opt-in source/application frame cap through Reflex; not a final-output target |
 | `RaiseFrameCeiling` | `0` | Raises an old Streamline plugin's compiled hard limit to 6x. Off by default because that breaks some games; the stale device-limit bypass needed by STALKER 2 is always applied |
 | `RuntimeSelectionMode` | `0` | `0` preserves the game's runtime policy, `1` disables OTA/downloaded plugins to prefer local files, and `2` forces the NVIDIA OTA flags; restart required |
-| `HDRCompatibilityMode` | `0` | `0` is **Native** (default for new configurations), `1` forces UI Composition, `2` enables **Automatic Guard + UI Composition (HDR compatibility)**, and `3` enables Final Color Fallback; existing saved values remain unchanged |
-| `DepthEdgeGuardLevel` | `0` | Optional depth-edge tuning: `0` keeps the game value; `1`-`4` select progressively lower separation thresholds |
 
 If a game has its own multiplier selector, leave `ForceMultiplier` at `0` and use
 the game's setting. A fixed value is an absolute override: for example, if the
@@ -706,14 +559,6 @@ the effective downstream request separately.
 
 - First compare native 2x with the addon completely removed and restart the
   game. Artifacts that remain are part of the game's native DLSS-G integration.
-- Start with **Native**. For known HDR-related issues, try **Automatic Guard +
-  UI Composition (HDR compatibility)**; if HUD/UI elements then show artifacts,
-  switch back to **Native**. Use **Force UI Composition** and **Final Color
-  Fallback** only as controlled A/B comparisons.
-- Restart and compare **Prefer full Blackwell framework kernels** on and off.
-  Off uses the release-0.7 midpoint correction as the control path.
-- Test the optional depth-edge levels one at a time and fully recheck pacing;
-  leave the setting off if it does not produce a repeatable visual improvement.
 - The addon cannot reconstruct missing or incorrect motion vectors, depth,
   exposure, distortion data, or camera matrices supplied by the game.
 
@@ -740,34 +585,9 @@ with a compiled-in `0.5`, so every generated frame lands at the temporal
 midpoint: 4x produces three identical half-way frames, the counter doubles and
 the motion does not get smoother.
 
-The experimental full-kernel path uses the Blackwell motion-vector, inpaint,
-and inpaint-decision programs rebuilt for Ada. Each target is accepted only
-when the original ELF fingerprint **and exact fatbin slot size** match the
-locally generated compatibility table. The replacement cubin is then written
-inside that original slot in mapped process memory; fatbin headers, entry
-descriptors, registration metadata, surrounding provider data, and pacing code
-are left untouched. The Blackwell motion-vector program consumes the generated
-frame's temporal parameter natively, so it replaces rather than stacks with the
-older midpoint rewrite.
-
-The source repository does not store generated cubin tables. They are produced
-locally from installed NVIDIA providers during release preparation and excluded
-from source control. No complete NVIDIA DLL or provider package is included.
-
-If the complete Blackwell path cannot be identified unambiguously, the addon
-fails closed to the release-0.7 behavior: it decompresses the supported Ada
-kernel's PTX, rewrites the blend weight to use the temporal parameter, and lets
-the driver JIT the corrected version. The overlay reports which path applied.
-Changing **Prefer full Blackwell framework kernels** requires a game restart.
-
-When enabled, **Intermediate scatter retention** selects an exact-fingerprint
-variant of the Blackwell intermediate motion-vector kernel. It relaxes only the
-identified motion-consistency input and retains the separate depth test.
-**Validated warp blend** operates later through a separately validated PTX
-fatbin redirect. Its rebuilt fatbin preserves all original entries around the
-modified program. Both paths modify mapped process memory only, validate the
-provider and original payload exactly, and fall back without patching when any
-identity or layout check fails.
+The addon decompresses the supported Ada kernel's PTX, rewrites the blend
+weight to use the temporal parameter, and lets the driver JIT the corrected
+version. The overlay reports the result for each provider.
 
 DLSS-G owns frame generation and presentation pacing; this addon does not
 implement a separate frame scheduler or issue generated-frame presents. With
@@ -781,10 +601,10 @@ in [`addon.cpp`](src/addons/mfgunlock/addon.cpp).
 
 ## Release Validation
 
-Code-side release checks use MSVC Release builds, native static analysis, and
-the tests in `tests/`. The project source is warning-clean in the latest check;
-the analyzer reports only existing warnings in external ReShade/Streamline
-headers. The final manual gate used a controlled STALKER 2 presentation trace.
+Code-side release checks use MSVC Release builds and native static analysis. The
+project source is warning-clean in the latest check; the analyzer reports only
+existing warnings in external ReShade/Streamline headers. The final manual gate
+used a controlled STALKER 2 presentation trace.
 
 > **STALKER 2 frame-pacing validation (September 10, 2026):** one 45-second
 > release-gate run used DLSS-G 310.9.1, Streamline 2.14.1, Dynamic MFG with
@@ -797,31 +617,6 @@ headers. The final manual gate used a controlled STALKER 2 presentation trace.
 This is a single release-gate trace, not a cross-version performance benchmark.
 It validates the active 4x presentation path and does not claim zero game-side
 stutter, universal compatibility, or an addon-overhead difference.
-
-> **Onimusha: Way of the Sword thin-geometry validation (September 11, 2026):**
-> a 45-second release-candidate run used an RTX 4070 SUPER, D3D12, Streamline
-> 2.10.3, a mapped DLSS-G 310.9.1 provider, fixed 4x, Hardware: Independent
-> Flip, and both Intermediate Scatter Retention and Validated Warp Blend.
-> PresentMon recorded 9,312 display intervals at 4.446 ms median, 6.245 ms p95
-> and 8.486 ms p99 (222.90 FPS average). The AnimationTime cadence heuristic
-> measured 3.998x from 2,347 source-frame samples and 7,036 generated-frame
-> candidates; two source intervals exceeded the robust 30.768 ms threshold.
-
-This Onimusha result validates the tested 4x cadence with both experimental
-quality mechanisms active. It remains one controlled run, not a universal
-performance or artifact-free compatibility claim.
-
-Use
-[`Capture-STALKER2-FramePacing.ps1`](src/addons/mfgdiagnostics/Capture-STALKER2-FramePacing.ps1)
-for three repeated 45-second runs of each case: native 2x without the addon,
-addon loaded at native 2x, addon 3x, and addon 4x. Keep the same warmed-up save,
-camera route, resolution, cap, HDR, VSync/G-SYNC state, driver, and runtime DLLs.
-Remove the diagnostic companion addon for these performance runs. Each capture
-records PresentMon data, an NVAPI before/after snapshot, and a version/hash
-inventory of relevant loaded modules; the analyzer reports display/application
-interval distributions, robust outliers, Present API time, available GPU and
-instrumented latency fields, and only clearly labeled heuristic generated-frame
-cadence.
 
 ## RTX 30-series support
 
@@ -857,11 +652,6 @@ is `build.vs/Release/renodx-mfgunlock.addon64`.
 
 Prebuilt binaries are attached to [Releases](../../releases).
 
-The separate, read-only diagnostic addon and capture tools used for Streamline
-input and PresentMon analysis are documented in
-[`src/addons/mfgdiagnostics/README.md`](src/addons/mfgdiagnostics/README.md).
-They are developer tools and are not required for normal use.
-
 ## Credits
 
 - [dashdogy/RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock)
@@ -881,26 +671,8 @@ They are developer tools and are not required for normal use.
   [`dlssg_for_sm86`](https://github.com/sdli1995/dlssg_for_sm86) implementation
   that brings DLSS-G multi-frame generation to supported RTX 30-series/SM86
   configurations.
-- [Matias Lombo](https://github.com/matiasLombo/mfg-unlock) identified and
-  validated the benefit of rebuilding DLSS-G's Blackwell framework kernels for
-  Ada, including the motion-vector estimate, inpaint, and inpaint-decision
-  stages. This fork's experimental full-kernel path follows his proven
-  precompiled-cubin, exact-fingerprint, in-place replacement method; its
-  release payload table is generated with his `rebuild_cubins.py` workflow.
-- Tony Joaca, author of DLSSG-Transfusion, publicly identified
-  `Kernel_BlendCandidatesFused` as the useful intervention point behind his
-  `qualityValidWarp` quality option. That research informed this fork's
-  separately implemented and more conservative **Validated warp blend**
-  experiment. No code or binary payload from DLSSG-Transfusion is included.
-- The **Intermediate scatter retention** analysis and experimental `+120`
-  motion-consistency variant were developed independently in this fork. The
-  underlying DLSS-G kernels remain NVIDIA technology and are not claimed as
-  original project code.
 - Special thanks to [mugensc](https://next.nexusmods.com/profile/mugensc) for the
   RenoDX DLSS5 compatibility testing and known-good runtime combination.
-- Special thanks to Artur from DLSS Enabler for the valuable debugging insights
-  during the investigation of the Hogwarts Legacy HDR + Frame Generation issue,
-  which helped lead to the fix included in this fork.
 - [u/amart565](https://www.reddit.com/user/amart565/) tested and documented the
   ReShade + MFG Unlock installation workflow for Xbox Game Pass / UWP-style game packages,
   including Vulkan titles such as Indiana Jones and DOOM: The Dark Ages.

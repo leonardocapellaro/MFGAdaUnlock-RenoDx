@@ -1,5 +1,5 @@
 /*
- * Presentation-pacing policy shared by the addon and its regression test.
+ * Presentation-pacing policy for the addon.
  * SPDX-License-Identifier: MIT
  */
 

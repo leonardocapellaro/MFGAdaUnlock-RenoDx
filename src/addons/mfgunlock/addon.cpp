@@ -122,8 +122,6 @@
 #include "./midpoint.hpp"
 #include "./ngx_hook.hpp"
 #include "./pacing_policy.hpp"
-#include "./thin_geometry.hpp"
-#include "./blackwell.hpp"
 
 namespace {
 
@@ -143,18 +141,6 @@ std::atomic_bool g_force_flip_meter_off{false};
 std::atomic_bool g_configured_force_flip_meter_off{false};
 std::atomic_bool g_temporal_fix{true};
 std::atomic_bool g_configured_temporal_fix{true};
-std::atomic_bool g_blackwell_framework_kernels{true};
-std::atomic_bool g_configured_blackwell_framework_kernels{true};
-// The two complementary thin-geometry mechanisms are the experimental quality
-// default. Persisted user choices still take precedence over these defaults.
-std::atomic_bool g_thin_geometry_validated_warp_blend{true};
-std::atomic_bool g_configured_thin_geometry_validated_warp_blend{true};
-std::atomic_bool g_thin_geometry_previous_scatter{false};
-std::atomic_bool g_configured_thin_geometry_previous_scatter{false};
-// The independently developed intermediate-scatter variant remains paired with
-// validated warp blend by default; either mechanism can still be tested alone.
-std::atomic_bool g_thin_geometry_intermediate_scatter{true};
-std::atomic_bool g_configured_thin_geometry_intermediate_scatter{true};
 // Raising the plugin's own clamp broke GTA V Enhanced -- its 2.9.1.0 plugin was
 // only ever shipped bounded at 3, and lifting that is not the same as it being
 // able to cope. Off by default; updating the plugin is the sound fix.
@@ -745,182 +731,19 @@ void RestoreDlssgArchGate() {
 // smoother than 2x despite double the counter. See midpoint.hpp.
 
 std::atomic_bool g_midpoint_patched{false};
-std::atomic_bool g_blackwell_patched{false};
 struct MidpointModulePatch {
   HMODULE module;
   std::vector<mfgunlock::midpoint::Patch> patches;
   void* allocation;
 };
 std::vector<MidpointModulePatch> g_midpoint_modules;
-struct BlackwellModulePatch {
-  HMODULE module;
-  std::vector<mfgunlock::blackwell::Patch> patches;
-  std::vector<void*> allocations;
-  mfgunlock::blackwell::Result result;
-};
-std::vector<BlackwellModulePatch> g_blackwell_modules;
 std::vector<HMODULE> g_midpoint_rejected_modules;
 std::string g_midpoint_detail;
-std::string g_blackwell_detail;
 std::atomic<int> g_midpoint_attempts{0};
-
-struct ThinGeometryModulePatch {
-  HMODULE module = nullptr;
-  std::string provider_version;
-  std::vector<mfgunlock::thingeometry::Redirect> redirects;
-  mfgunlock::thingeometry::Result result;
-  mfgunlock::thingeometry::MechanismResult intermediate_scatter;
-};
-std::vector<ThinGeometryModulePatch> g_thin_geometry_modules;
-std::atomic_bool g_thin_geometry_patched{false};
-std::atomic<int> g_thin_geometry_attempts{0};
-
-bool ThinGeometryRequested() {
-  return g_thin_geometry_validated_warp_blend.load(std::memory_order_relaxed) ||
-         g_thin_geometry_previous_scatter.load(std::memory_order_relaxed) ||
-         g_thin_geometry_intermediate_scatter.load(std::memory_order_relaxed);
-}
-
-bool ModuleHasThinGeometryResult(HMODULE mod) {
-  return std::any_of(
-      g_thin_geometry_modules.begin(), g_thin_geometry_modules.end(),
-      [mod](const ThinGeometryModulePatch& patch) { return patch.module == mod; });
-}
 
 bool ModuleHasTemporalPatch(HMODULE mod) {
   return std::any_of(g_midpoint_modules.begin(), g_midpoint_modules.end(),
-                     [mod](const MidpointModulePatch& patch) { return patch.module == mod; }) ||
-         std::any_of(g_blackwell_modules.begin(), g_blackwell_modules.end(),
-                     [mod](const BlackwellModulePatch& patch) { return patch.module == mod; });
-}
-
-bool PatchBlackwellInModule(HMODULE mod) {
-  if (mod == nullptr || ModuleHasTemporalPatch(mod)) return false;
-  std::vector<mfgunlock::blackwell::Patch> patches;
-  std::vector<void*> allocations;
-  mfgunlock::blackwell::Result result;
-  std::string detail;
-  std::string provider_version;
-  std::string provider_reason;
-  const bool supported_thin_geometry_provider =
-      mfgunlock::thingeometry::IsSupportedProvider(
-          mod, provider_version, provider_reason);
-  const bool enable_intermediate_scatter =
-      g_thin_geometry_intermediate_scatter.load(std::memory_order_relaxed) &&
-      supported_thin_geometry_provider;
-  if (!mfgunlock::blackwell::Apply(mod, patches, allocations, result, detail,
-                                   enable_intermediate_scatter)) {
-    g_blackwell_detail = detail;
-    return false;
-  }
-
-  g_blackwell_detail = detail;
-  g_blackwell_modules.push_back(
-      {mod, std::move(patches), std::move(allocations), result});
-  g_blackwell_patched.store(true, std::memory_order_release);
-  char module_path[MAX_PATH] = {};
-  GetModuleFileNameA(mod, module_path, MAX_PATH);
-  std::stringstream stream;
-  stream << "mfgunlock: full Blackwell framework kernels applied to " << module_path << " -- "
-         << detail << "; the separate midpoint rewrite is not needed for this provider.";
-  reshade::log::message(reshade::log::level::info, stream.str().c_str());
-  return true;
-}
-
-void LogThinGeometryMechanism(
-    const char* module_path, const std::string& provider_version,
-    const char* mechanism, const char* application_path,
-    const mfgunlock::thingeometry::MechanismResult& result) {
-  std::ostringstream stream;
-  stream << "mfgunlock: Enhanced thin-geometry interpolation: provider="
-         << (module_path[0] == '\0' ? "<unknown>" : module_path)
-         << ", version="
-         << (provider_version.empty() ? "unsupported/unknown" : provider_version)
-         << ", mechanism=" << mechanism
-         << ", detected=" << (result.detected ? "yes" : "no")
-         << ", path=" << application_path
-         << ", applied=" << (result.applied ? "yes" : "no")
-         << ", validation="
-         << (result.detail.empty()
-                 ? (result.applied ? "exact provider and payload match" : "not applied")
-                 : result.detail);
-  reshade::log::message(result.applied ? reshade::log::level::info
-                                      : reshade::log::level::warning,
-                        stream.str().c_str());
-}
-
-void PatchThinGeometryInModule(HMODULE mod) {
-  if (mod == nullptr || !ThinGeometryRequested() ||
-      ModuleHasThinGeometryResult(mod)) {
-    return;
-  }
-  ++g_thin_geometry_attempts;
-
-  ThinGeometryModulePatch module_result;
-  module_result.module = mod;
-  const mfgunlock::thingeometry::Options options{
-      g_thin_geometry_validated_warp_blend.load(std::memory_order_relaxed),
-      g_thin_geometry_previous_scatter.load(std::memory_order_relaxed)};
-  mfgunlock::thingeometry::Apply(mod, options, module_result.redirects,
-                                module_result.result,
-                                module_result.provider_version);
-
-  module_result.intermediate_scatter.requested =
-      g_thin_geometry_intermediate_scatter.load(std::memory_order_relaxed);
-  if (module_result.intermediate_scatter.requested) {
-    std::string provider_reason;
-    if (!mfgunlock::thingeometry::IsSupportedProvider(
-            mod, module_result.provider_version, provider_reason)) {
-      module_result.intermediate_scatter.detail = provider_reason;
-    } else {
-      const auto blackwell = std::find_if(
-          g_blackwell_modules.begin(), g_blackwell_modules.end(),
-          [mod](const BlackwellModulePatch& patch) { return patch.module == mod; });
-      if (blackwell == g_blackwell_modules.end()) {
-        module_result.intermediate_scatter.detail =
-            "requires the exact full Blackwell motion-vector path; current temporal fallback retained";
-      } else {
-        module_result.intermediate_scatter.detected =
-            blackwell->result.intermediate_scatter;
-        module_result.intermediate_scatter.applied =
-            blackwell->result.intermediate_scatter;
-        module_result.intermediate_scatter.detail =
-            blackwell->result.intermediate_scatter
-                ? "exact original Ada cubin hash matched the generated bounded-retention variant"
-                : "exact intermediate-scatter variant did not match; baseline Blackwell cubin retained";
-      }
-    }
-  }
-
-  char module_path[MAX_PATH] = {};
-  GetModuleFileNameA(mod, module_path, MAX_PATH);
-  if (module_result.result.validated_warp_blend.requested) {
-    LogThinGeometryMechanism(
-        module_path, module_result.provider_version,
-        "validated warp blend", "BlendCandidatesFused PTX descriptor redirect",
-        module_result.result.validated_warp_blend);
-  }
-  if (module_result.result.previous_scatter.requested) {
-    LogThinGeometryMechanism(
-        module_path, module_result.provider_version,
-        "previous-to-current scatter retention",
-        "EstimatePrev2CurrScatter PTX descriptor redirect",
-        module_result.result.previous_scatter);
-  }
-  if (module_result.intermediate_scatter.requested) {
-    LogThinGeometryMechanism(
-        module_path, module_result.provider_version,
-        "intermediate scatter retention",
-        "Blackwell EstimateIntermMvecsScatter in-place cubin selection",
-        module_result.intermediate_scatter);
-  }
-
-  if (module_result.result.validated_warp_blend.applied ||
-      module_result.result.previous_scatter.applied ||
-      module_result.intermediate_scatter.applied) {
-    g_thin_geometry_patched.store(true, std::memory_order_release);
-  }
-  g_thin_geometry_modules.push_back(std::move(module_result));
+                     [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
 }
 
 void PatchMidpointInModule(HMODULE mod) {
@@ -958,23 +781,12 @@ void PatchMidpointInModule(HMODULE mod) {
 void PatchTemporalInModule(HMODULE mod) {
   if (mod == nullptr || ModuleHasTemporalPatch(mod)) return;
   // NGX may map a DriverStore fallback only long enough to inspect it and then
-  // unload it. Once both full-kernel and midpoint validation rejected a module,
-  // never dereference that cached HMODULE again: it may no longer name mapped
-  // memory by the next bounded discovery pass.
+  // unload it. Once midpoint validation rejected a module, never dereference
+  // that cached HMODULE again: it may no longer name mapped memory by the next
+  // bounded discovery pass.
   if (std::find(g_midpoint_rejected_modules.begin(), g_midpoint_rejected_modules.end(), mod) !=
       g_midpoint_rejected_modules.end()) {
     return;
-  }
-  const bool prefer_blackwell =
-      g_blackwell_framework_kernels.load(std::memory_order_relaxed);
-  if (prefer_blackwell) {
-    if (PatchBlackwellInModule(mod)) return;
-    char module_path[MAX_PATH] = {};
-    GetModuleFileNameA(mod, module_path, MAX_PATH);
-    std::stringstream stream;
-    stream << "mfgunlock: full Blackwell framework path not available for " << module_path
-           << " -- " << g_blackwell_detail << "; trying the 0.7 midpoint fallback.";
-    reshade::log::message(reshade::log::level::warning, stream.str().c_str());
   }
   PatchMidpointInModule(mod);
 }
@@ -1000,9 +812,6 @@ void ProcessLoadedDlssgModule(HMODULE mod) {
       g_temporal_fix.load(std::memory_order_relaxed)) {
     PatchTemporalInModule(mod);
   }
-  if (g_enabled.load(std::memory_order_relaxed) && ThinGeometryRequested()) {
-    PatchThinGeometryInModule(mod);
-  }
   ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
 }
 
@@ -1014,9 +823,6 @@ void RunProviderMaintenance() {
   if (g_enabled.load(std::memory_order_relaxed) &&
       g_temporal_fix.load(std::memory_order_relaxed)) {
     TryPatchMidpoint();
-  }
-  if (g_enabled.load(std::memory_order_relaxed) && ThinGeometryRequested()) {
-    for (HMODULE mod : g_dlssg_modules) PatchThinGeometryInModule(mod);
   }
   version_candidates = g_gate_modules;
   ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
@@ -1039,38 +845,9 @@ void RestoreMidpoint() {
       }
     }
   }
-  for (auto& module : g_blackwell_modules) {
-    if (mfgunlock::runtimeversion::IsMappedImage(module.module)) {
-      mfgunlock::blackwell::Restore(module.patches, module.allocations);
-    } else {
-      module.patches.clear();
-      module.allocations.clear();
-    }
-  }
   g_midpoint_modules.clear();
-  g_blackwell_modules.clear();
   g_midpoint_rejected_modules.clear();
   g_midpoint_patched.store(false, std::memory_order_release);
-  g_blackwell_patched.store(false, std::memory_order_release);
-}
-
-void RestoreThinGeometry() {
-  for (auto& module : g_thin_geometry_modules) {
-    if (mfgunlock::runtimeversion::IsMappedImage(module.module)) {
-      mfgunlock::thingeometry::Restore(module.redirects);
-    } else {
-      for (auto& redirect : module.redirects) {
-        redirect.descriptors.clear();
-        if (redirect.allocation != nullptr) {
-          VirtualFree(redirect.allocation, 0, MEM_RELEASE);
-          redirect.allocation = nullptr;
-        }
-      }
-      module.redirects.clear();
-    }
-  }
-  g_thin_geometry_modules.clear();
-  g_thin_geometry_patched.store(false, std::memory_order_release);
 }
 
 // ------------------------------------------------- flip metering (sl.dlss_g)
@@ -1629,8 +1406,7 @@ bool DiscoveryRequirementsMet() {
        g_gate_patched.load(std::memory_order_acquire)) &&
       (!g_enabled.load(std::memory_order_relaxed) ||
        !g_temporal_fix.load(std::memory_order_relaxed) ||
-       g_midpoint_patched.load(std::memory_order_acquire) ||
-       g_blackwell_patched.load(std::memory_order_acquire));
+       g_midpoint_patched.load(std::memory_order_acquire));
   const bool pacing_ready =
       !g_force_flip_meter_off.load(std::memory_order_relaxed) ||
       g_flip_meter_patched.load(std::memory_order_acquire) ||
@@ -1720,7 +1496,7 @@ void OnPresentStartDiscovery(reshade::api::command_queue* /*queue*/,
                              const reshade::api::rect* /*dirty_rects*/) {
   // A primary swapchain can disappear while an already-existing secondary
   // survives (resize, launcher/video swapchain, device recreation). Promote
-  // the next presenting swapchain once instead of leaving HDR/API state stale.
+  // the next presenting swapchain once instead of leaving API state stale.
   if (swapchain != nullptr &&
       g_primary_swapchain.load(std::memory_order_acquire) == nullptr) {
     reshade::api::swapchain* expected = nullptr;
@@ -1750,30 +1526,18 @@ void OnPresentStartDiscovery(reshade::api::command_queue* /*queue*/,
         mfgunlock::framecount::NotifyDynamicD3D12(
             detected == DetectedRenderApi::kD3D12);
       }
-      mfgunlock::framecount::NotifySwapchainTransition();
-    }
-  }
-  if (swapchain != nullptr &&
-      swapchain == g_primary_swapchain.load(std::memory_order_acquire)) {
-    const auto color_space = swapchain->get_color_space();
-    if (color_space != reshade::api::color_space::unknown) {
-      const bool hdr = color_space == reshade::api::color_space::scrgb ||
-                       color_space == reshade::api::color_space::hdr10_pq ||
-                       color_space == reshade::api::color_space::hdr10_hlg;
-      mfgunlock::framecount::NotifyHdrState(hdr);
     }
   }
   StartDiscoveryWorker();
 }
 
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
-  bool primary_transition = false;
   if (swapchain != nullptr) {
     if (auto* device = swapchain->get_device(); device != nullptr) {
       const auto back_buffer = swapchain->get_back_buffer(0);
       const auto desc = device->get_resource_desc(back_buffer);
       const uint64_t area = static_cast<uint64_t>(desc.texture.width) *
-                            static_cast<uint64_t>(desc.texture.height);
+                             static_cast<uint64_t>(desc.texture.height);
       uint64_t selected_area = g_primary_swapchain_area.load(
           std::memory_order_relaxed);
       reshade::api::swapchain* selected = g_primary_swapchain.load(
@@ -1798,18 +1562,9 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
         g_render_api.store(detected, std::memory_order_relaxed);
         mfgunlock::framecount::NotifyDynamicD3D12(
             detected == DetectedRenderApi::kD3D12);
-        const auto color_space = swapchain->get_color_space();
-        if (color_space != reshade::api::color_space::unknown) {
-          const bool hdr = color_space == reshade::api::color_space::scrgb ||
-                           color_space == reshade::api::color_space::hdr10_pq ||
-                           color_space == reshade::api::color_space::hdr10_hlg;
-          mfgunlock::framecount::NotifyHdrState(hdr);
-        }
-        primary_transition = true;
       }
     }
   }
-  if (primary_transition) mfgunlock::framecount::NotifySwapchainTransition();
 }
 
 void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
@@ -1819,7 +1574,6 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
     g_primary_swapchain_area.store(0, std::memory_order_relaxed);
     g_render_api.store(DetectedRenderApi::kUnknown, std::memory_order_relaxed);
     mfgunlock::framecount::NotifyDynamicD3D12(false);
-    mfgunlock::framecount::NotifySwapchainTransition();
   }
 }
 
@@ -1883,16 +1637,10 @@ void OnInitCommandQueue(reshade::api::command_queue* /*queue*/) {
 void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   bool gate_patched = false;
   bool midpoint_patched = false;
-  bool blackwell_patched = false;
-  bool thin_geometry_patched = false;
   size_t gate_provider_count = 0;
   size_t gate_site_count = 0;
   size_t midpoint_provider_count = 0;
-  size_t blackwell_provider_count = 0;
-  size_t thin_geometry_provider_count = 0;
   std::string midpoint_detail;
-  std::string blackwell_detail;
-  ThinGeometryModulePatch thin_geometry_last;
   bool ceiling_patched = false;
   unsigned int ceiling_compiled = 0;
   unsigned int ceiling_effective = 0;
@@ -1900,18 +1648,10 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   AcquireSRWLockShared(&g_provider_maintenance_lock);
   gate_patched = g_gate_patched.load(std::memory_order_relaxed);
   midpoint_patched = g_midpoint_patched.load(std::memory_order_relaxed);
-  blackwell_patched = g_blackwell_patched.load(std::memory_order_relaxed);
-  thin_geometry_patched = g_thin_geometry_patched.load(std::memory_order_relaxed);
   gate_provider_count = g_gate_modules.size();
   gate_site_count = g_gate_sites.size();
   midpoint_provider_count = g_midpoint_modules.size();
-  blackwell_provider_count = g_blackwell_modules.size();
-  thin_geometry_provider_count = g_thin_geometry_modules.size();
   midpoint_detail = g_midpoint_detail;
-  blackwell_detail = g_blackwell_detail;
-  if (!g_thin_geometry_modules.empty()) {
-    thin_geometry_last = g_thin_geometry_modules.back();
-  }
   ReleaseSRWLockShared(&g_provider_maintenance_lock);
   AcquireSRWLockShared(&g_streamline_maintenance_lock);
   ceiling_patched = g_ceiling_patched.load(std::memory_order_relaxed);
@@ -2074,138 +1814,6 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   } else {
     ImGui::TextDisabled("No successful slDLSSGGetState telemetry sample yet (last result: %u).",
                         mfgunlock::framecount::g_state_result.load(std::memory_order_relaxed));
-  }
-
-  ImGui::Separator();
-  constexpr const char* kHdrModes[] = {
-      "Native (Default — recommended for most games)",
-      "Force UI Composition (Advanced)",
-      "Automatic Guard + UI Composition (HDR compatibility)",
-      "Final Color Fallback (Troubleshooting)"};
-  int hdr_mode = static_cast<int>(
-      mfgunlock::framecount::g_hdr_compatibility_mode.load(std::memory_order_relaxed));
-  if (ImGui::Combo("Frame-generation input quality", &hdr_mode, kHdrModes,
-                   static_cast<int>(std::size(kHdrModes)))) {
-    mfgunlock::framecount::g_hdr_compatibility_mode.store(
-        static_cast<unsigned int>(hdr_mode), std::memory_order_relaxed);
-    mfgunlock::framecount::NotifyQualityModeChanged();
-    reshade::set_config_value(nullptr, kConfigSection, "HDRCompatibilityMode", hdr_mode);
-  }
-  if (hdr_mode == static_cast<int>(
-                      mfgunlock::framecount::HdrCompatibilityMode::kNative)) {
-    ImGui::TextDisabled(
-        "Passes the game's optional HUD-less and UI tags through unchanged.\n"
-        "Recommended for most games; use this if HUD elements show artifacts.");
-  } else if (hdr_mode == static_cast<int>(
-                             mfgunlock::framecount::HdrCompatibilityMode::kUiRecomposition)) {
-    ImGui::TextDisabled(
-        "Forces Streamline to process the scene and UI separately. This requires\n"
-        "the game to provide correctly matched buffers and color spaces.");
-  } else if (hdr_mode == static_cast<int>(
-                             mfgunlock::framecount::HdrCompatibilityMode::kFinalColorFallback)) {
-    ImGui::TextDisabled(
-        "Rejects optional HUD/UI inputs when their metadata is invalid and uses\n"
-        "final color as the safe fallback. It also resets temporal history once\n"
-        "after HDR, swapchain, resolution, option or multiplier transitions.");
-  } else {
-    ImGui::TextDisabled(
-        "Use for HDR artifacts in games such as Hogwarts Legacy, Jusant, and\n"
-        "Mafia: The Old Country. If HUD elements show artifacts, use Native.\n"
-        "Matched SDR inputs may use UI Composition; unsafe inputs fall back safely.");
-  }
-  ImGui::TextDisabled(
-      "Color, depth, motion vectors, temporal kernel and frame pacing are not rewritten.");
-  const bool hdr_active =
-      mfgunlock::framecount::g_hdr_active.load(std::memory_order_relaxed);
-  const bool hdr_seen =
-      mfgunlock::framecount::g_hdr_state_seen.load(std::memory_order_acquire);
-  ImGui::Text("HDR output detected: %s.",
-              hdr_seen ? (hdr_active ? "yes" : "no") : "not observed yet");
-  if (mfgunlock::framecount::g_ui_recomposition_applied.load(std::memory_order_relaxed)) {
-    ImGui::Text("Streamline accepted the UI-capable path (source options v%u).",
-                mfgunlock::framecount::g_ui_recomposition_source_version.load(
-                    std::memory_order_relaxed));
-    if (hdr_mode == static_cast<int>(
-                        mfgunlock::framecount::HdrCompatibilityMode::kAutomaticHybrid)) {
-      ImGui::TextDisabled(
-          "Quality Guard still controls whether optional HUD-less/UI tags are used.");
-    }
-  } else if (mfgunlock::framecount::g_ui_recomposition_fell_back.load(
-                 std::memory_order_relaxed)) {
-    ImGui::Text("UI Composition rejected (result %u); safe fallback is active.",
-                mfgunlock::framecount::g_ui_recomposition_result.load(
-                    std::memory_order_relaxed));
-  } else if (hdr_mode == static_cast<int>(
-                             mfgunlock::framecount::HdrCompatibilityMode::kAutomaticHybrid) &&
-             hdr_active) {
-    ImGui::TextDisabled(
-        "Automatic HDR final-color fallback active; UI Composition is intentionally not submitted.");
-  } else if (hdr_mode == static_cast<int>(
-                             mfgunlock::framecount::HdrCompatibilityMode::kAutomaticHybrid)) {
-    ImGui::TextDisabled(
-        hdr_seen
-            ? "Automatic SDR path is waiting for SetOptions and a valid HUD-less/UI pair."
-            : "Automatic mode is waiting for the primary swapchain color space.");
-  } else if (hdr_mode == static_cast<int>(
-                             mfgunlock::framecount::HdrCompatibilityMode::kUiRecomposition)) {
-    ImGui::TextDisabled("UI Composition has not been submitted yet; toggle FG after changing modes.");
-  } else if (hdr_mode == static_cast<int>(
-                             mfgunlock::framecount::HdrCompatibilityMode::kFinalColorFallback)) {
-    ImGui::TextDisabled(
-        "Conservative final-color fallback active; UI Composition is intentionally not submitted.");
-  }
-  if (mfgunlock::framecount::g_hud_inputs_suppressed.load(std::memory_order_relaxed)) {
-    ImGui::Text("Quality Guard filtered incompatible optional HUD/UI input.");
-    ImGui::TextDisabled("Observed issue mask: 0x%X.",
-                        mfgunlock::framecount::g_quality_issue_mask.load(
-                            std::memory_order_relaxed));
-  }
-  if (mfgunlock::framecount::g_quality_mode_change_pending.load(
-          std::memory_order_acquire)) {
-    ImGui::TextDisabled(
-        "Quality-mode option change pending; toggle Frame Generation off/on to apply it.");
-  }
-  if (mfgunlock::framecount::g_quality_tag_batch_too_large.load(
-          std::memory_order_relaxed)) {
-    ImGui::TextDisabled(
-        "Quality Guard saw a tag batch larger than 64; that batch was forwarded unchanged.");
-  }
-  if (mfgunlock::framecount::g_quality_viewport_capacity_exhausted.load(
-          std::memory_order_relaxed)) {
-    ImGui::TextDisabled(
-        "More than eight Streamline viewports were seen; extra viewports use conservative fallback.");
-  }
-  const auto reset_count = mfgunlock::framecount::g_quality_resets_injected.load(
-      std::memory_order_relaxed);
-  if (reset_count != 0) {
-    ImGui::Text("Quality Guard synchronized temporal history %llu time(s).", reset_count);
-  }
-
-  constexpr const char* kDepthEdgeModes[] = {
-      "Off - game value",
-      "Mild (20.0)",
-      "Balanced (10.0)",
-      "Strong (4.0)",
-      "Aggressive (1.0)"};
-  int depth_edge_level = static_cast<int>(
-      mfgunlock::framecount::g_depth_edge_guard_level.load(std::memory_order_relaxed));
-  if (ImGui::Combo("Optional depth-edge guard", &depth_edge_level,
-                   kDepthEdgeModes,
-                   static_cast<int>(std::size(kDepthEdgeModes)))) {
-    mfgunlock::framecount::g_depth_edge_guard_level.store(
-        static_cast<unsigned int>(depth_edge_level), std::memory_order_relaxed);
-    mfgunlock::framecount::NotifyDepthEdgeTuningChanged();
-    reshade::set_config_value(nullptr, kConfigSection, "DepthEdgeGuardLevel",
-                              depth_edge_level);
-  }
-  ImGui::TextDisabled(
-      "Lower values can improve nearby object/lower-screen edge separation.\n"
-      "This does not perform camera-turn resets or modify frame pacing.");
-  if (mfgunlock::framecount::g_depth_edge_override_applied.load(
-          std::memory_order_relaxed)) {
-    ImGui::Text("Depth-edge override active; game supplied %.3f.",
-                mfgunlock::framecount::g_last_native_depth_separation.load(
-                    std::memory_order_relaxed));
   }
 
   ImGui::Separator();
@@ -2459,143 +2067,10 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::TextDisabled("Temporal-fix change is saved for the next restart.");
   }
 
-  bool blackwell = g_configured_blackwell_framework_kernels.load(
-      std::memory_order_relaxed);
-  if (ImGui::Checkbox("Prefer full Blackwell framework kernels on next restart (experimental)",
-                      &blackwell)) {
-    g_configured_blackwell_framework_kernels.store(
-        blackwell, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "BlackwellFrameworkKernels",
-                              blackwell ? 1 : 0);
-  }
-  ImGui::TextDisabled(
-      "On: full motion-vector/inpaint path when validated. Off: 0.7 midpoint correction.\n"
-      "Restart the game after changing this option.");
-  if (blackwell !=
-      g_blackwell_framework_kernels.load(std::memory_order_relaxed)) {
-    ImGui::TextDisabled("Kernel-path change is saved for the next restart.");
-  }
-
   ImGui::Separator();
-  ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.22f, 1.0f),
-                     "Enhanced thin-geometry interpolation (EXPERIMENTAL)");
-  ImGui::TextDisabled(
-      "Complementary DLSS-G kernel experiments for thin objects and reprojection.\n"
-      "Both are enabled by default but remain independently selectable. Restart\n"
-      "the game after changing either option; results can vary by game.");
-
-  bool intermediate_scatter =
-      g_configured_thin_geometry_intermediate_scatter.load(
-          std::memory_order_relaxed);
-  if (ImGui::Checkbox(
-          "Intermediate scatter retention (Experimental - Recommended)##thin_intermediate",
-          &intermediate_scatter)) {
-    g_configured_thin_geometry_intermediate_scatter.store(
-        intermediate_scatter, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection,
-                              "ThinGeometryIntermediateScatter",
-                              intermediate_scatter ? 1 : 0);
-  }
-  ImGui::TextWrapped(
-      "Enabled by default. Relaxes one motion-consistency rejection while DLSS-G\n"
-      "builds motion vectors for intermediate generated frames. The separate depth\n"
-      "test stays active. May preserve fences, foliage and moving edges; disable it\n"
-      "if a game shows added trails, ghosting or disocclusion artifacts.");
-
-  bool validated_warp =
-      g_configured_thin_geometry_validated_warp_blend.load(
-          std::memory_order_relaxed);
-  if (ImGui::Checkbox(
-          "Validated warp blend (Experimental - Recommended)##thin_validated_warp",
-          &validated_warp)) {
-    g_configured_thin_geometry_validated_warp_blend.store(
-        validated_warp, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection,
-                              "ThinGeometryValidatedWarpBlend",
-                              validated_warp ? 1 : 0);
-  }
-  ImGui::TextWrapped(
-      "Enabled by default. Later-stage blend experiment inspired by Tony Joaca's\n"
-      "DLSSG-Transfusion qualityValidWarp work and independently implemented here.\n"
-      "It validates candidate bounds, finite color and mutual agreement before\n"
-      "gradually trusting accepted warped color more. It may reduce flicker, but can\n"
-      "also increase persistence or ghosting in some scenes.");
-
-  bool previous_scatter =
-      g_configured_thin_geometry_previous_scatter.load(
-          std::memory_order_relaxed);
-  if (ImGui::Checkbox(
-          "Previous-to-current scatter retention (Experimental/Unstable)##thin_previous",
-          &previous_scatter)) {
-    g_configured_thin_geometry_previous_scatter.store(
-        previous_scatter, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection,
-                              "ThinGeometryPreviousScatter",
-                              previous_scatter ? 1 : 0);
-  }
-  ImGui::TextDisabled(
-      "Advanced research control; disabled by default. It changes motion rejection\n"
-      "between real frames and was unstable in initial game testing. Not recommended\n"
-      "for normal use; bounds logic remains unchanged.");
-
-  if (validated_warp !=
-          g_thin_geometry_validated_warp_blend.load(std::memory_order_relaxed) ||
-      previous_scatter !=
-          g_thin_geometry_previous_scatter.load(std::memory_order_relaxed) ||
-      intermediate_scatter !=
-          g_thin_geometry_intermediate_scatter.load(std::memory_order_relaxed)) {
-    ImGui::TextDisabled(
-        "Thin-geometry selection is saved for the next restart.");
-  }
-
-  const auto show_thin_result = [](const char* label,
-                                   const mfgunlock::thingeometry::MechanismResult& result) {
-    if (!result.requested) return;
-    if (result.applied) {
-      ImGui::TextWrapped("%s: applied (%s).", label, result.detail.c_str());
-    } else {
-      ImGui::TextDisabled("%s: not applied (%s).", label,
-                          result.detail.empty() ? "waiting for a supported provider"
-                                                : result.detail.c_str());
-    }
-  };
-  if (thin_geometry_provider_count != 0) {
-    ImGui::TextDisabled("Validated provider result: %s; processed provider(s): %zu.",
-                        thin_geometry_last.provider_version.empty()
-                            ? "unsupported/unknown"
-                            : thin_geometry_last.provider_version.c_str(),
-                        thin_geometry_provider_count);
-    show_thin_result("Validated warp blend",
-                     thin_geometry_last.result.validated_warp_blend);
-    show_thin_result("Previous scatter retention",
-                     thin_geometry_last.result.previous_scatter);
-    show_thin_result("Intermediate scatter retention",
-                     thin_geometry_last.intermediate_scatter);
-  } else if (g_thin_geometry_validated_warp_blend.load(
-                 std::memory_order_relaxed) ||
-             g_thin_geometry_previous_scatter.load(std::memory_order_relaxed) ||
-             g_thin_geometry_intermediate_scatter.load(
-                 std::memory_order_relaxed)) {
-    ImGui::TextDisabled("Waiting for a supported DLSS-G provider (attempt %d).",
-                        g_thin_geometry_attempts.load(std::memory_order_relaxed));
-  }
-  if (thin_geometry_patched) {
-    ImGui::TextDisabled(
-        "At least one thin-geometry mechanism passed exact validation this session.");
-  }
-
-  ImGui::Separator();
-  if (blackwell_patched) {
-    ImGui::TextWrapped("Blackwell framework kernels: %zu provider(s); last result: %s.",
-                       blackwell_provider_count, blackwell_detail.c_str());
-  } else if (midpoint_patched) {
+  if (midpoint_patched) {
     ImGui::TextWrapped("Temporal fix: %zu provider(s); last result: %s.",
                        midpoint_provider_count, midpoint_detail.c_str());
-    if (g_blackwell_framework_kernels.load(std::memory_order_relaxed) &&
-        !blackwell_detail.empty()) {
-      ImGui::TextDisabled("Full Blackwell path fell back safely: %s.",
-                          blackwell_detail.c_str());
-    }
   } else {
     ImGui::TextDisabled("Temporal fix not applied yet (attempt %d).",
                         g_midpoint_attempts.load(std::memory_order_relaxed));
@@ -2659,36 +2134,6 @@ void LoadConfig() {
   g_configured_temporal_fix.store(
       g_temporal_fix.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
-  if (reshade::get_config_value(nullptr, kConfigSection, "BlackwellFrameworkKernels", value)) {
-    g_blackwell_framework_kernels.store(value != 0, std::memory_order_relaxed);
-  }
-  g_configured_blackwell_framework_kernels.store(
-      g_blackwell_framework_kernels.load(std::memory_order_relaxed),
-      std::memory_order_relaxed);
-  if (reshade::get_config_value(nullptr, kConfigSection,
-                                "ThinGeometryValidatedWarpBlend", value)) {
-    g_thin_geometry_validated_warp_blend.store(value != 0,
-                                                std::memory_order_relaxed);
-  }
-  g_configured_thin_geometry_validated_warp_blend.store(
-      g_thin_geometry_validated_warp_blend.load(std::memory_order_relaxed),
-      std::memory_order_relaxed);
-  if (reshade::get_config_value(nullptr, kConfigSection,
-                                "ThinGeometryPreviousScatter", value)) {
-    g_thin_geometry_previous_scatter.store(value != 0,
-                                            std::memory_order_relaxed);
-  }
-  g_configured_thin_geometry_previous_scatter.store(
-      g_thin_geometry_previous_scatter.load(std::memory_order_relaxed),
-      std::memory_order_relaxed);
-  if (reshade::get_config_value(nullptr, kConfigSection,
-                                "ThinGeometryIntermediateScatter", value)) {
-    g_thin_geometry_intermediate_scatter.store(value != 0,
-                                                std::memory_order_relaxed);
-  }
-  g_configured_thin_geometry_intermediate_scatter.store(
-      g_thin_geometry_intermediate_scatter.load(std::memory_order_relaxed),
-      std::memory_order_relaxed);
   if (reshade::get_config_value(nullptr, kConfigSection, "RaiseFrameCeiling", value)) {
     g_raise_ceiling.store(value != 0, std::memory_order_relaxed);
   }
@@ -2741,40 +2186,7 @@ void LoadConfig() {
     mfgunlock::framecount::g_dynamic_reflex_source_cap.store(
         value != 0, std::memory_order_relaxed);
   }
-  if (reshade::get_config_value(nullptr, kConfigSection, "HDRCompatibilityMode", value)) {
-    if (value < static_cast<int>(mfgunlock::framecount::HdrCompatibilityMode::kNative) ||
-        value > static_cast<int>(
-                    mfgunlock::framecount::HdrCompatibilityMode::kFinalColorFallback)) {
-      value = static_cast<int>(
-          mfgunlock::framecount::HdrCompatibilityMode::kAutomaticHybrid);
-    }
-    mfgunlock::framecount::g_hdr_compatibility_mode.store(
-        static_cast<unsigned int>(value), std::memory_order_relaxed);
-  } else if (reshade::get_config_value(nullptr, kConfigSection,
-                                       "HDRUIRecomposition", value)) {
-    // Preserve an explicit legacy opt-in. A legacy false value represented the
-    // absence of that experiment, not a deliberate request to bypass every
-    // quality guard, so migrate it to the new recommended automatic mode.
-    mfgunlock::framecount::g_hdr_compatibility_mode.store(
-        static_cast<unsigned int>(
-            value != 0 ? mfgunlock::framecount::HdrCompatibilityMode::kUiRecomposition
-                       : mfgunlock::framecount::HdrCompatibilityMode::kAutomaticHybrid),
-        std::memory_order_relaxed);
-  }
-  // When neither the current nor legacy key exists, this is a fresh
-  // configuration and the atomic's Native default remains active.
-  if (reshade::get_config_value(nullptr, kConfigSection, "DepthEdgeGuardLevel", value)) {
-    if (value < 0 || value > 4) value = 0;
-    mfgunlock::framecount::g_depth_edge_guard_level.store(
-        static_cast<unsigned int>(value), std::memory_order_relaxed);
-  } else if (reshade::get_config_value(nullptr, kConfigSection,
-                                       "DisocclusionGuardLevel", value)) {
-    // Preserve the selection made by the earlier experimental build while the
-    // renamed key makes its purpose clearer going forward.
-    if (value < 0 || value > 4) value = 0;
-    mfgunlock::framecount::g_depth_edge_guard_level.store(
-        static_cast<unsigned int>(value), std::memory_order_relaxed);
-  }
+
 }
 
 }  // namespace
@@ -2841,7 +2253,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_overlay("MFG Unlock", OnRegisterOverlay);
       mfgunlock::loadhook::Uninstall();
       mfgunlock::framecount::Uninstall();
-      RestoreThinGeometry();
       RestoreMidpoint();
       RestoreDlssgArchGate();
       RestoreFrameCountCeiling();
