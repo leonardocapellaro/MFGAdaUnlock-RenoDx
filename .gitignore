@@ -28,3 +28,5 @@ desktop.ini
 
 # Local tooling state
 .serena/
+# Machine-specific LSP config (absolute paths to local MinGW / header clones).
+.clangd
