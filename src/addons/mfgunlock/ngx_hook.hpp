@@ -72,22 +72,29 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
 
   std::vector<std::pair<void**, void*>> resolved;
   resolved.reserve(hooks.size());
+  const auto clear_resolved = [&resolved]() {
+    for (auto& [real, unused] : resolved) *real = nullptr;
+  };
   for (const auto& [name, real, replacement] : hooks) {
     FARPROC proc = GetProcAddress(module, name);
     if (proc == nullptr) {
+      clear_resolved();
       std::stringstream s;
       s << "mfgunlock::hook: " << module_label << " has no export " << name
         << " -- not hooking anything in this module.";
       reshade::log::message(reshade::log::level::error, s.str().c_str());
       return false;
     }
-    if (*real != nullptr) return false;  // already installed
+    if (*real != nullptr) {
+      clear_resolved();
+      return false;  // already installed
+    }
     *real = reinterpret_cast<void*>(proc);
     resolved.emplace_back(real, replacement);
   }
 
   if (DetourTransactionBegin() != NO_ERROR) {
-    for (auto& [real, unused] : resolved) *real = nullptr;
+    clear_resolved();
     return false;
   }
 
@@ -101,7 +108,7 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
   if (!threads_ok) {
     DetourTransactionAbort();
     for (HANDLE h : threads) CloseHandle(h);
-    for (auto& [real, unused] : resolved) *real = nullptr;
+    clear_resolved();
     reshade::log::message(
         reshade::log::level::error,
         "mfgunlock::hook: could not register every thread with the Detours "
@@ -121,7 +128,7 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
   if (!ok || DetourTransactionCommit() != NO_ERROR) {
     if (!ok) DetourTransactionAbort();
     for (HANDLE h : threads) CloseHandle(h);
-    for (auto& [real, unused] : resolved) *real = nullptr;
+    clear_resolved();
     std::stringstream s;
     s << "mfgunlock::hook: failed to install hooks in " << module_label << ".";
     reshade::log::message(reshade::log::level::error, s.str().c_str());

@@ -474,15 +474,22 @@ inline bool Apply(HMODULE module, std::vector<Patch>& patches, void*& allocation
 }
 
 inline void Restore(std::vector<Patch>& patches, void*& allocation) {
+  bool restored_all = true;
   for (const auto& patch : patches) {
     DWORD old_protect = 0;
-    if (VirtualProtect(patch.slot, sizeof(uint64_t), PAGE_READWRITE, &old_protect) == 0) continue;
+    if (VirtualProtect(patch.slot, sizeof(uint64_t), PAGE_READWRITE,
+                       &old_protect) == 0) {
+      restored_all = false;
+      continue;
+    }
     *patch.slot = patch.original;
     DWORD ignored = 0;
     VirtualProtect(patch.slot, sizeof(uint64_t), old_protect, &ignored);
   }
   patches.clear();
-  if (allocation != nullptr) {
+  // Never free a replacement while a live descriptor may still reference it.
+  // A small leak during an abnormal unload is safer than a dangling pointer.
+  if (restored_all && allocation != nullptr) {
     VirtualFree(allocation, 0, MEM_RELEASE);
     allocation = nullptr;
   }
