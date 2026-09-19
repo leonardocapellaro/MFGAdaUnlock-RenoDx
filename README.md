@@ -363,8 +363,12 @@ is attempted only after the loaded versions and capability bit are confirmed.
 Transient initialization failures are retried on later game-side SetOptions
 calls; structural rejection fails safely to the game's fixed mode. The panel
 reports pending, active, rejected, version-mismatch and VSync-capability states
-separately. Renderer eligibility follows the selected primary swapchain rather
-than whichever temporary or auxiliary ReShade device initialized last. After
+separately, and keeps the Dynamic MFG and Reflex source-cap controls locked
+until the exact validated Streamline 2.14.1 / DLSS-G 310.9.1 pair is actually
+loaded on D3D12 (or the provider explicitly reports Dynamic MFG as
+unsupported). Renderer eligibility
+follows the selected primary swapchain rather than whichever temporary or
+auxiliary ReShade device initialized last. After
 changing Dynamic settings, toggle Frame Generation off/on in the game so it
 submits a fresh SetOptions call.
 

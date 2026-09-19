@@ -67,14 +67,12 @@ inline std::atomic_bool g_hooked{false};
 inline std::atomic_bool g_intercepted{false};
 inline std::atomic_bool g_game_request_seen{false};
 inline std::atomic<unsigned int> g_last_requested{0};
-inline std::atomic<unsigned int> g_last_forced{0};
 inline std::atomic_bool g_effective_request_seen{false};
 inline std::atomic<unsigned int> g_last_effective_generated{0};
 inline std::atomic<unsigned int> g_fixed_override_status{
     static_cast<unsigned int>(forcepolicy::FixedOverrideStatus::kNative)};
 inline std::atomic_bool g_declined_no_pacing{false};
 inline std::atomic<unsigned int> g_force_failed_for{0};
-inline std::atomic<unsigned int> g_last_result{0};
 inline std::atomic_bool g_native_request_seen{false};
 inline std::atomic<unsigned int> g_native_requested{0};
 inline std::atomic<unsigned int> g_native_result{0};
@@ -85,7 +83,6 @@ inline std::atomic_bool g_status_ok_logged{false};
 inline std::atomic_bool g_failure_status_logged{false};
 inline std::atomic<unsigned int> g_actual_frames_presented{0};
 inline std::atomic<unsigned int> g_max_actual_frames_presented{0};
-inline std::atomic<unsigned long long> g_state_samples{0};
 inline std::atomic<unsigned int> g_seen_present_counts{0};
 inline std::atomic_bool g_addon_enabled{true};
 
@@ -200,6 +197,15 @@ inline void ObserveStreamlinePluginVersion(HMODULE module,
   }
 }
 
+// The release-supported Dynamic MFG stack: the exact Streamline 2.14.1 wrapper
+// and the exact 310.9.1 provider, both loaded. The runtime gates on it before
+// submitting eDynamic, and the overlay uses it to lock the Dynamic controls
+// while the correct DLLs are not loaded.
+inline bool DynamicVersionStackReady() {
+  return g_streamline_2_14_1_active.load(std::memory_order_acquire) &&
+         g_dlssg_310_9_1_seen.load(std::memory_order_acquire);
+}
+
 // Published by addon.cpp only after the active Streamline wrapper's pacing and
 // hard ceiling have both been verified. Games such as STALKER 2 build their
 // native 2x/3x/4x selector from DLSSGState::numFramesToGenerateMax rather than
@@ -265,11 +271,6 @@ inline bool ShouldApplyReflexTarget() {
       g_dynamic_applied.load(std::memory_order_relaxed),
       g_dynamic_reflex_source_cap.load(std::memory_order_relaxed),
       g_dynamic_target_fps.load(std::memory_order_relaxed));
-}
-
-inline bool DynamicVersionStackReady() {
-  return g_streamline_2_14_1_active.load(std::memory_order_acquire) &&
-         g_dlssg_310_9_1_seen.load(std::memory_order_acquire);
 }
 
 inline bool IsTransientDynamicFailure(sl::Result result) {
@@ -621,7 +622,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
   // pending and is applied only when the game submits its next enabled call.
   if (!game_enabled) {
     const sl::Result result = CallSetOptions(viewport, options);
-    g_last_forced.store(0, std::memory_order_relaxed);
     g_effective_request_seen.store(false, std::memory_order_release);
     g_fixed_override_status.store(
         static_cast<unsigned int>(
@@ -636,7 +636,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
   // eligible. Fixed selection remains saved for the next non-Dynamic call.
   if (decision.source == forcepolicy::RequestSource::kDynamic) {
     const sl::Result result = CallSetOptions(viewport, options);
-    g_last_forced.store(0, std::memory_order_relaxed);
     if (g_dynamic_applied.load(std::memory_order_acquire)) {
       g_effective_request_seen.store(false, std::memory_order_release);
       g_fixed_override_status.store(
@@ -662,7 +661,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
 
   if (decision.source == forcepolicy::RequestSource::kNative) {
     const sl::Result result = CallSetOptions(viewport, options);
-    g_last_forced.store(0, std::memory_order_relaxed);
     g_declined_no_pacing.store(false, std::memory_order_relaxed);
     g_fixed_override_status.store(
         static_cast<unsigned int>(forcepolicy::FixedOverrideStatus::kNative),
@@ -696,9 +694,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
   const uint32_t desired = decision.downstream_generated_frames;
   if (!decision.OverridesGeneratedFrames()) {
     const sl::Result result = CallSetOptions(viewport, options);
-    g_last_result.store(static_cast<unsigned int>(result),
-                        std::memory_order_relaxed);
-    g_last_forced.store(0, std::memory_order_relaxed);
     if (result == sl::Result::eOk) {
       g_last_effective_generated.store(requested, std::memory_order_relaxed);
       g_effective_request_seen.store(true, std::memory_order_release);
@@ -723,9 +718,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
           "mfgunlock: refusing to override an unknown DLSSGOptions ABI; forwarding the game's request unchanged.");
     }
     const sl::Result result = CallSetOptions(viewport, options);
-    g_last_result.store(static_cast<unsigned int>(result),
-                        std::memory_order_relaxed);
-    g_last_forced.store(0, std::memory_order_relaxed);
     if (result == sl::Result::eOk) {
       g_last_effective_generated.store(requested, std::memory_order_relaxed);
       g_effective_request_seen.store(true, std::memory_order_release);
@@ -755,9 +747,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
             "game's own request alone.");
       }
       const sl::Result result = CallSetOptions(viewport, options);
-      g_last_result.store(static_cast<unsigned int>(result),
-                          std::memory_order_relaxed);
-      g_last_forced.store(0, std::memory_order_relaxed);
       if (result == sl::Result::eOk) {
         g_last_effective_generated.store(requested, std::memory_order_relaxed);
         g_effective_request_seen.store(true, std::memory_order_release);
@@ -796,8 +785,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
           << " on retry -- that first failure was feature-manager state, not the count.";
         reshade::log::message(reshade::log::level::info, s.str().c_str());
       }
-      g_last_result.store(static_cast<unsigned int>(retry), std::memory_order_relaxed);
-      g_last_forced.store(desired, std::memory_order_relaxed);
       g_last_effective_generated.store(desired, std::memory_order_relaxed);
       g_effective_request_seen.store(true, std::memory_order_release);
       g_fixed_override_status.store(
@@ -816,8 +803,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
         << requested << ". The count itself is being refused, not a transient state.";
       reshade::log::message(reshade::log::level::warning, s.str().c_str());
     }
-    g_last_result.store(static_cast<unsigned int>(retry), std::memory_order_relaxed);
-    g_last_forced.store(0, std::memory_order_relaxed);
     const sl::Result fallback = CallSetOptions(viewport, options);
     if (fallback == sl::Result::eOk) {
       g_last_effective_generated.store(requested, std::memory_order_relaxed);
@@ -838,8 +823,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
       << multiplier << "x). slDLSSGSetOptions accepted it.";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  g_last_result.store(static_cast<unsigned int>(result), std::memory_order_relaxed);
-  g_last_forced.store(desired, std::memory_order_relaxed);
   g_last_effective_generated.store(desired, std::memory_order_relaxed);
   g_effective_request_seen.store(true, std::memory_order_release);
   g_fixed_override_status.store(
@@ -923,7 +906,6 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
            !g_max_actual_frames_presented.compare_exchange_weak(
                observed_max, presented, std::memory_order_relaxed)) {
     }
-    g_state_samples.fetch_add(1, std::memory_order_relaxed);
     const bool first = !g_state_seen.exchange(true, std::memory_order_relaxed);
     bool log_status = false;
     if (status == 0) {
@@ -1059,7 +1041,6 @@ inline void NotifyDynamicD3D12(bool d3d12) {
 }
 
 inline void NotifyFixedMultiplierChanged(unsigned int) {
-  g_last_forced.store(0, std::memory_order_relaxed);
   g_effective_request_seen.store(false, std::memory_order_release);
   g_declined_no_pacing.store(false, std::memory_order_relaxed);
   g_force_failed_for.store(0, std::memory_order_relaxed);

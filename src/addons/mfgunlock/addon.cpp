@@ -13,7 +13,7 @@
  * LAYOUT
  *
  *   this file      arch gates, flip metering, the plugin's frame ceiling,
- *                  config, overlay, and the fallback parameter override
+ *                  config and overlay
  *   midpoint.hpp   the temporal fix -- fatbin/PTX rewrite
  *   framecount.hpp forcing numFramesToGenerate through slDLSSGSetOptions
  *   loadhook.hpp   catching the snippet as it is mapped
@@ -68,21 +68,6 @@
  * mapped copy is never re-checked.
  *
  * ---------------------------------------------------------------------------
- * THE PARAMETER OVERRIDE (kept, but not what does the work)
- *
- * NVSDK_NGX_*_GetParameters / GetCapabilityParameters are also hooked, and slot
- * 11 of the returned object's vtable -- Get(const char*, unsigned int*) -- is
- * replaced so "DLSSG.MultiFrameCountMax" can be answered directly.
- * NVSDK_NGX_Parameter declares 8 Set overloads before its 8 Get overloads,
- * which is where that slot number comes from.
- *
- * This was the original approach, and it does not work with Streamline:
- * sl.dlss_g builds its own NVSDK_NGX_Parameter rather than passing NGX's along,
- * so the patch arms and never fires. It is kept because it costs nothing and is
- * the only lever for an NGX consumer that is not Streamline. The arch gates
- * above are what actually does the job in every game tested.
- *
- * ---------------------------------------------------------------------------
  * PACING
  *
  * Current Streamline runtimes provide working native pacing on Ada after the
@@ -109,11 +94,6 @@
 #include <utility>
 #include <vector>
 
-#include <d3d11.h>
-#include <d3d12.h>
-
-#include <nvsdk_ngx.h>
-
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -126,10 +106,6 @@
 namespace {
 
 constexpr const char* kConfigSection = "RenoDX.MFGUnlock";
-constexpr const char* kParamName = "DLSSG.MultiFrameCountMax";
-
-// Slot 11 of NVSDK_NGX_Parameter == Get(const char*, unsigned int*).
-constexpr size_t kGetUInt32Slot = 11;
 
 constexpr unsigned int kMinCount = 2;
 constexpr unsigned int kMaxCount = 5;
@@ -239,227 +215,10 @@ const char* RenderApiName(DetectedRenderApi api) {
   }
 }
 
-// Our own image. Both marker scans look for strings that are, necessarily,
-// string literals inside this very DLL -- so without excluding ourselves the
-// scan happily identifies the addon as the DLSS-G plugin and then fails to
-// make sense of it. Harmless where the real plugin is enumerated first;
-// fatal where it is not loaded at all.
-
-std::atomic_bool g_vtable_patched{false};
-std::atomic_bool g_override_reported{false};
-std::atomic<unsigned int> g_override_hits{0};
-std::atomic<unsigned int> g_runtime_reported_value{0};
-
-void** g_patched_slot = nullptr;
-void* g_original_slot_value = nullptr;
-
-using GetUInt32Fn = NVSDK_NGX_Result (*)(void* self, const char* name, unsigned int* out);
-GetUInt32Fn g_real_get_uint32 = nullptr;
-
-bool NgxFailed(NVSDK_NGX_Result result) {
-  return (static_cast<unsigned int>(result) & 0xfff00000u) == 0xbad00000u;
-}
-
-NVSDK_NGX_Result HookedGetUInt32(void* self, const char* name, unsigned int* out) {
-  NVSDK_NGX_Result result = g_real_get_uint32(self, name, out);
-
-  if (!g_enabled.load(std::memory_order_relaxed)) return result;
-  if (name == nullptr || out == nullptr) return result;
-  if (std::strcmp(name, kParamName) != 0) return result;
-
-  const bool failed = NgxFailed(result);
-  const unsigned int reported = failed ? 0u : *out;
-  const unsigned int want = g_max_count.load(std::memory_order_relaxed);
-
-  g_runtime_reported_value.store(reported, std::memory_order_relaxed);
-
-  // Never lower a value the runtime already offers.
-  if (!failed && reported >= want) return result;
-
-  *out = want;
-  g_override_hits.fetch_add(1, std::memory_order_relaxed);
-
-  if (!g_override_reported.exchange(true, std::memory_order_relaxed)) {
-    std::stringstream s;
-    s << "mfgunlock: " << kParamName << " came back as ";
-    if (failed) {
-      s << "a failure (0x" << std::hex << static_cast<unsigned int>(result) << std::dec << ")";
-    } else {
-      s << reported;
-    }
-    s << "; reporting " << want << " instead.";
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
-  }
-  return NVSDK_NGX_Result_Success;
-}
-
-bool PatchParameterVTable(NVSDK_NGX_Parameter* params) {
-  if (params == nullptr) return false;
-  if (g_vtable_patched.load(std::memory_order_acquire)) return true;
-
-  auto** vtable = *reinterpret_cast<void***>(params);
-  if (vtable == nullptr) return false;
-  void** slot = &vtable[kGetUInt32Slot];
-
-  DWORD old_protect = 0;
-  if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect) == 0) {
-    reshade::log::message(reshade::log::level::error,
-                          "mfgunlock: could not make the NGX parameter vtable writable.");
-    return false;
-  }
-
-  g_original_slot_value = *slot;
-  g_real_get_uint32 = reinterpret_cast<GetUInt32Fn>(g_original_slot_value);
-  *slot = reinterpret_cast<void*>(&HookedGetUInt32);
-  g_patched_slot = slot;
-
-  DWORD ignored = 0;
-  VirtualProtect(slot, sizeof(void*), old_protect, &ignored);
-
-  g_vtable_patched.store(true, std::memory_order_release);
-  reshade::log::message(
-      reshade::log::level::info,
-      "mfgunlock: NGX parameter vtable patched; multi-frame capability override armed.");
-  return true;
-}
-
-void RestoreParameterVTable() {
-  if (!g_vtable_patched.load(std::memory_order_acquire)) return;
-  if (g_patched_slot == nullptr || g_original_slot_value == nullptr) return;
-
-  DWORD old_protect = 0;
-  if (VirtualProtect(g_patched_slot, sizeof(void*), PAGE_READWRITE, &old_protect) != 0) {
-    *g_patched_slot = g_original_slot_value;
-    DWORD ignored = 0;
-    VirtualProtect(g_patched_slot, sizeof(void*), old_protect, &ignored);
-  }
-  g_vtable_patched.store(false, std::memory_order_release);
-}
-
-// ---------------------------------------------------------------- NGX entries
-
-using NgxParamsOutFn = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter**);
-
-NgxParamsOutFn g_real_allocate_parameters = nullptr;
-NgxParamsOutFn g_real_get_capability_parameters = nullptr;
-NgxParamsOutFn g_real_get_device_capability_parameters = nullptr;
-NgxParamsOutFn g_real_get_parameters = nullptr;
-
-NVSDK_NGX_Result NVSDK_CONV HookedAllocateParameters(NVSDK_NGX_Parameter** out_parameters) {
-  NVSDK_NGX_Result result = g_real_allocate_parameters(out_parameters);
-  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
-  return result;
-}
-
-NVSDK_NGX_Result NVSDK_CONV HookedGetCapabilityParameters(NVSDK_NGX_Parameter** out_parameters) {
-  NVSDK_NGX_Result result = g_real_get_capability_parameters(out_parameters);
-  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
-  return result;
-}
-
-NVSDK_NGX_Result NVSDK_CONV HookedGetDeviceCapabilityParameters(
-    NVSDK_NGX_Parameter** out_parameters) {
-  NVSDK_NGX_Result result = g_real_get_device_capability_parameters(out_parameters);
-  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
-  return result;
-}
-
-NVSDK_NGX_Result NVSDK_CONV HookedGetParameters(NVSDK_NGX_Parameter** out_parameters) {
-  NVSDK_NGX_Result result = g_real_get_parameters(out_parameters);
-  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
-  return result;
-}
-
-// All four hand out a parameter block, and which one Streamline uses for the
-// capability query is not something we can know from outside. They all live in
-// the NGX loader, so hooking the set costs nothing extra -- and missing the one
-// that is actually used would look exactly like the addon doing nothing.
-const std::vector<mfgunlock::hook::HookItem> kNgxHooks = {
-    {"NVSDK_NGX_D3D12_AllocateParameters",
-     reinterpret_cast<void**>(&g_real_allocate_parameters),
-     reinterpret_cast<void*>(&HookedAllocateParameters)},
-    {"NVSDK_NGX_D3D12_GetCapabilityParameters",
-     reinterpret_cast<void**>(&g_real_get_capability_parameters),
-     reinterpret_cast<void*>(&HookedGetCapabilityParameters)},
-    {"NVSDK_NGX_D3D12_GetDeviceCapabilityParameters",
-     reinterpret_cast<void**>(&g_real_get_device_capability_parameters),
-     reinterpret_cast<void*>(&HookedGetDeviceCapabilityParameters)},
-    {"NVSDK_NGX_D3D12_GetParameters",
-     reinterpret_cast<void**>(&g_real_get_parameters),
-     reinterpret_cast<void*>(&HookedGetParameters)},
-};
-
-// Only the NGX loader hands out parameter blocks; the feature snippets do not
-// export these.
-constexpr const wchar_t* kNgxModules[] = {L"_nvngx.dll", L"nvngx.dll"};
-
-std::atomic_bool g_hooked{false};
-int g_hook_attempts = 0;
-constexpr int kMaxHookAttempts = 8;
-
-// Resolved, not hooked -- used only to hand back the block we allocate below.
-NgxParamsOutFn g_real_destroy_parameters = nullptr;
-
-void TryInstallHooks() {
-  if (g_hooked.load(std::memory_order_acquire)) return;
-  if (g_hook_attempts >= kMaxHookAttempts) return;
-
-  for (const auto* name : kNgxModules) {
-    if (name == nullptr) continue;
-    HMODULE mod = GetModuleHandleW(name);
-    if (mod == nullptr) continue;
-    if (GetProcAddress(mod, "NVSDK_NGX_D3D12_AllocateParameters") == nullptr) continue;
-
-    ++g_hook_attempts;
-    char narrow[64] = {};
-    WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
-    if (!mfgunlock::hook::Install(mod, kNgxHooks, narrow)) continue;
-
-    g_real_destroy_parameters = reinterpret_cast<NgxParamsOutFn>(
-        reinterpret_cast<void*>(GetProcAddress(mod, "NVSDK_NGX_D3D12_DestroyParameters")));
-
-    g_hooked.store(true, std::memory_order_release);
-    return;
-  }
-}
-
-// Every parameter object shares one vtable, so we do not have to wait for the
-// game to hand us one: allocate a throwaway block ourselves, take the vtable
-// from it, and give it straight back. Before NGX is initialised this just
-// returns an error and we retry on the next present.
-//
-// Waiting passively would mean the override arms only once DLSS-G is already
-// initialising, which is a race against the very query we want to answer.
-int g_bootstrap_attempts = 0;
-constexpr int kMaxBootstrapAttempts = 2000;
-
-void TryBootstrapVTable() {
-  if (g_vtable_patched.load(std::memory_order_acquire)) return;
-  if (!g_hooked.load(std::memory_order_acquire)) return;
-  if (g_real_allocate_parameters == nullptr) return;
-  if (g_bootstrap_attempts >= kMaxBootstrapAttempts) return;
-  ++g_bootstrap_attempts;
-
-  NVSDK_NGX_Parameter* params = nullptr;
-  NVSDK_NGX_Result result = g_real_allocate_parameters(&params);
-  if (NgxFailed(result) || params == nullptr) return;
-
-  PatchParameterVTable(params);
-
-  if (g_real_destroy_parameters != nullptr) {
-    reinterpret_cast<NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter*)>(
-        reinterpret_cast<void*>(g_real_destroy_parameters))(params);
-  }
-}
-
 // ------------------------------------------------------- in-memory arch gate
 //
-// The read-side override assumes Streamline reads the capability through the
-// NGX loader's parameter object. It does not: the vtable patch arms fine and
-// then never fires, because sl.* carries its own NVSDK_NGX_Parameter
-// implementation and we never see that vtable.
-//
-// So patch the decision instead of the answer. NGX verifies the snippet's
+// The capability is decided inside the provider's own code, so patch the
+// decision instead of intercepting an answer. NGX verifies the snippet's
 // Authenticode signature when it LOADS the file -- which is why the on-disk
 // byte patch made frame generation disappear entirely. Editing the same bytes
 // in the mapped image afterwards is never re-checked, so the signed DLL loads
@@ -539,6 +298,11 @@ bool ModuleContains(HMODULE mod, const char* needle, size_t needle_len) {
   return false;
 }
 
+// Our own image. Both marker scans look for strings that are, necessarily,
+// string literals inside this very DLL -- so without excluding ourselves the
+// scan happily identifies the addon as the DLSS-G plugin and then fails to
+// make sense of it. Harmless where the real plugin is enumerated first;
+// fatal where it is not loaded at all.
 void RememberDlssgModule(HMODULE mod) {
   if (mod == nullptr || mod == g_self_module) return;
   if (std::find(g_dlssg_modules.begin(), g_dlssg_modules.end(), mod) == g_dlssg_modules.end()) {
@@ -1817,8 +1581,25 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   }
 
   ImGui::Separator();
+  // The option only takes effect on the validated stack: D3D12, the exact
+  // Streamline 2.14.1 wrapper and the exact 310.9.1 provider both loaded.
+  // Lock the controls while that is not the case instead of letting the user
+  // toggle a setting that silently never applies.
+  const bool dynamic_version_stack_ready =
+      mfgunlock::framecount::g_streamline_version_seen.load(
+          std::memory_order_acquire) &&
+      mfgunlock::framecount::g_dlssg_version_seen.load(std::memory_order_acquire) &&
+      mfgunlock::framecount::DynamicVersionStackReady();
+  const bool dynamic_provider_unsupported =
+      mfgunlock::framecount::g_dynamic_support_seen.load(
+          std::memory_order_acquire) &&
+      !mfgunlock::framecount::g_dynamic_supported.load(std::memory_order_relaxed);
+  const bool dynamic_mfg_controls_active =
+      render_api == DetectedRenderApi::kD3D12 && dynamic_version_stack_ready &&
+      !dynamic_provider_unsupported;
   bool dynamic_mfg =
       mfgunlock::framecount::g_dynamic_mfg_enabled.load(std::memory_order_relaxed);
+  ImGui::BeginDisabled(!dynamic_mfg_controls_active);
   if (ImGui::Checkbox("Use NVIDIA Dynamic MFG (310.9.1 + SL 2.14.1)", &dynamic_mfg)) {
     mfgunlock::framecount::g_dynamic_mfg_enabled.store(dynamic_mfg,
                                                         std::memory_order_relaxed);
@@ -1837,6 +1618,7 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     reshade::set_config_value(nullptr, kConfigSection, "DynamicTargetFPS",
                               dynamic_target);
   }
+  ImGui::EndDisabled();
   ImGui::TextDisabled(
       "Requires D3D12, driver 595.41+, DLSS-G 310.9.1 and Streamline 2.14.1.\n"
       "0 = display refresh. Uses Streamline's native eDynamic scheduler; no Present hook.\n"
@@ -1916,6 +1698,12 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   bool reflex_source_cap =
       mfgunlock::framecount::g_dynamic_reflex_source_cap.load(
           std::memory_order_relaxed);
+  // The cap is only ever applied while Dynamic MFG is enabled and actively
+  // running (pacing::ShouldApplyReflexSourceCap). Lock it while the Dynamic
+  // MFG stack is unavailable or Dynamic MFG itself is switched off.
+  const bool reflex_cap_controls_active =
+      dynamic_mfg_controls_active && dynamic_mfg;
+  ImGui::BeginDisabled(!reflex_cap_controls_active);
   if (ImGui::Checkbox("Advanced: cap application-rendered FPS with Reflex",
                       &reflex_source_cap)) {
     mfgunlock::framecount::g_dynamic_reflex_source_cap.store(
@@ -1925,6 +1713,7 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
                               "DynamicReflexSourceCap",
                               reflex_source_cap ? 1 : 0);
   }
+  ImGui::EndDisabled();
   ImGui::TextDisabled(
       "This is a source-frame limiter, not a final-output target. Leave it off unless\n"
       "you intentionally calculated a rendered-FPS cap for your multiplier/refresh setup.");
